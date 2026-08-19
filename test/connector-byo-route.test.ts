@@ -18,7 +18,10 @@ const userHeaders = (principalId: string) => ({
   [PORTAL_IDENTITY_HEADER]: mintPortalIdentity({ p: principalId, exp: Date.now() + 60_000 }, PORTAL_SECRET),
 });
 
-function start(socketAppId = "A-ACME"): { base: string; built: BuiltApp; close: () => Promise<void> } {
+function start(
+  socketAppId = "A-ACME",
+  requireSignedPortalIdentity = false,
+): { base: string; built: BuiltApp; close: () => Promise<void> } {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "byo-route-")) }));
   const server = createInsecureTestServer(built.app, {
     oauthStateSecret: "byo-route-oauth-state-secret",
@@ -46,6 +49,7 @@ function start(socketAppId = "A-ACME"): { base: string; built: BuiltApp; close: 
     config: built.config,
     admin: built.admin,
     auditLog: built.auditLog,
+    requireSignedPortalIdentity,
   });
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -180,7 +184,7 @@ test("admin rejects Slack bot and Socket Mode tokens from different apps", async
 });
 
 test("signed-in users manage only their own encrypted Tlon connections", async () => {
-  const srv = start();
+  const srv = start("A-ACME", true);
   try {
     const alice = userHeaders("alice@example.com");
     const bob = userHeaders("bob@example.com");
