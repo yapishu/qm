@@ -53,6 +53,19 @@ docker buildx imagetools inspect ghcr.io/example/qm-sandbox:2026-08-18
 
 The nested daemons pull registry-digest images directly and do not currently receive private-registry credentials, so a recorded registry image must be anonymously pullable. Bare local image IDs are loaded from the host Docker image store and therefore do not use a registry.
 
+First-party service images follow the same rule. Published deployments pin registry digests in `imageOverrides`; a single test host can build every configured service from the checkout and then pin the resulting local IDs:
+
+```bash
+docker compose -f deploy/tenant-host/compose.yml run --rm host \
+  node /app/cli/bin/qm.ts host up "$QM_TENANT_ROOT/qm.host.jsonc" --build-from "$QM_SOURCE_ROOT"
+
+for service in core web-ui admin portal auth slack; do
+  docker image inspect "qm-$service:local" --format "\"$service\": \"{{.Id}}\"" 2>/dev/null || true
+done
+```
+
+Record the lines for the tenant's configured services in its `imageOverrides`. Later ordinary `host up` operations use those immutable local IDs without rebuilding or contacting a registry.
+
 The host loads that image into a dedicated nested Docker daemon for each tenant. Tenant cores never receive the host Docker socket or another tenant's daemon endpoint. The daemon requires mutual TLS, and only that tenant's core receives the client certificate; agent containers can reach the daemon network address but cannot authenticate to its API. Agent execution endpoints require unique per-container bearer credentials derived from a tenant-scoped secret. Sandbox daemon state, certificates, and the credential root are retained in tenant-scoped durable state.
 
 The gateway image must be pinned by manifest digest. Resolve the chosen official Caddy image before recording it:
@@ -91,6 +104,7 @@ To run the controller itself as a container, mount the tenant root at the same a
 The included Compose deployment handles these mounts:
 
 ```bash
+export QM_SOURCE_ROOT=/path/to/qm
 export QM_TENANT_ROOT=/srv/qm-host
 export QM_HOST_ADMIN_TOKEN="$(openssl rand -hex 32)"
 docker compose -f deploy/tenant-host/compose.yml up -d --build
@@ -105,6 +119,7 @@ docker run -d \
   -e QM_HOST_ADMIN_TOKEN \
   -e XDG_CONFIG_HOME=/var/lib/qm-host/config \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /path/to/qm:/path/to/qm:ro \
   -v /srv/qm-host:/srv/qm-host \
   -v qm-tenant-host-state:/var/lib/qm-host \
   -w /srv/qm-host \

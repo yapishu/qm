@@ -16,6 +16,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${QM_SOURCE_ROOT:?set QM_SOURCE_ROOT}:${QM_SOURCE_ROOT:?set QM_SOURCE_ROOT}:ro
       - ${QM_TENANT_ROOT:?set QM_TENANT_ROOT}:${QM_TENANT_ROOT:?set QM_TENANT_ROOT}
       - qm-tenant-host-state:/var/lib/qm-host
     working_dir: ${QM_TENANT_ROOT:?set QM_TENANT_ROOT}
