@@ -7,13 +7,27 @@ import {
   type ChannelStatus,
   type Story,
 } from "@tloncorp/api";
-import { swallow } from "../../chassis/src/errors.ts";
+import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { parseChannelMessage, parseDmMessage, dmInvites } from "./messages.ts";
 import { createPinnedOriginFetch, type PinnedOriginFetch } from "./network.ts";
 import type { Delivery, Installation } from "./types.ts";
 import { decodeDeliveryTarget } from "./target.ts";
 
 let apiTail = Promise.resolve();
+
+async function withinCleanup(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`cleanup timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export function originLockedFetch(baseUrl: string, fetchImpl: typeof fetch = fetch): typeof fetch {
   const origin = new URL(baseUrl).origin;
@@ -100,6 +114,7 @@ export class TlonConnection {
   private readonly inbound: (message: ReturnType<typeof parseChannelMessage>) => Promise<void>;
   private readonly createTransport: (baseUrl: string) => Promise<PinnedOriginFetch>;
   private readonly createClient: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
+  private readonly cleanupTimeoutMs: number;
 
   constructor(
     installation: Installation,
@@ -107,12 +122,14 @@ export class TlonConnection {
     deps: {
       createTransport?: (baseUrl: string) => Promise<PinnedOriginFetch>;
       createClient?: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
+      cleanupTimeoutMs?: number;
     } = {},
   ) {
     this.installation = installation;
     this.createTransport = deps.createTransport ?? createPinnedOriginFetch;
     this.createClient =
       deps.createClient ?? ((baseUrl, fetchImpl) => new Urbit(baseUrl, undefined, undefined, fetchImpl));
+    this.cleanupTimeoutMs = deps.cleanupTimeoutMs ?? 1_000;
     this.inbound = async (message) => {
       if (!message || this.seen.has(message.messageId)) return;
       this.seen.add(message.messageId);
@@ -221,27 +238,32 @@ export class TlonConnection {
     if (!client) throw new Error(`Tlon account ${this.installation.id} is not connected`);
     const target = decodeDeliveryTarget(delivery.destination.target);
     if (target.accountId !== this.installation.id) throw new Error("delivery belongs to another Tlon account");
-    await withApi(this.installation, client, async () => {
-      const content = textToStory(delivery.text);
-      const sentAt = deliveryTime(delivery);
-      if (target.replyTo) {
-        await sendReply({
-          channelId: target.target,
-          parentId: target.replyTo,
-          parentAuthor: target.parentAuthor ?? (target.kind === "dm" ? target.target : ""),
-          content,
-          sentAt,
-          authorId: this.installation.ship,
-        });
-      } else {
-        await sendPost({
-          channelId: target.target,
-          content,
-          sentAt,
-          authorId: this.installation.ship,
-        });
-      }
-    });
+    try {
+      await withApi(this.installation, client, async () => {
+        const content = textToStory(delivery.text);
+        const sentAt = deliveryTime(delivery);
+        if (target.replyTo) {
+          await sendReply({
+            channelId: target.target,
+            parentId: target.replyTo,
+            parentAuthor: target.parentAuthor ?? (target.kind === "dm" ? target.target : ""),
+            content,
+            sentAt,
+            authorId: this.installation.ship,
+          });
+        } else {
+          await sendPost({
+            channelId: target.target,
+            content,
+            sentAt,
+            authorId: this.installation.ship,
+          });
+        }
+      });
+    } catch (error) {
+      this.state = { status: "error", message: errMessage(error) };
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -252,10 +274,15 @@ export class TlonConnection {
   }
 
   private async release(client: Urbit | null, transport: PinnedOriginFetch | null): Promise<void> {
+    if (!transport || this.transport !== transport) return;
+    this.transport = null;
     if (this.client === client) this.client = null;
-    if (this.transport === transport) this.transport = null;
-    if (client) await client.delete().catch((error) => swallow(`delete Tlon channel ${this.installation.id}`, error));
-    if (transport)
-      await transport.close().catch((error) => swallow(`close Tlon transport ${this.installation.id}`, error));
+    if (client)
+      await withinCleanup(client.delete(), this.cleanupTimeoutMs).catch((error) =>
+        swallow(`delete Tlon channel ${this.installation.id}`, error),
+      );
+    await withinCleanup(transport.close(), this.cleanupTimeoutMs).catch((error) =>
+      swallow(`close Tlon transport ${this.installation.id}`, error),
+    );
   }
 }

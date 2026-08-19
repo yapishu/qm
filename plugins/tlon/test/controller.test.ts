@@ -48,8 +48,8 @@ test("a failed connected status report stops and removes the connection", async 
 
 test("stopping during startup closes the Airlock client and pinned transport", async () => {
   let rejectPoke = (_error: Error): void => {};
-  let deleted = false;
-  let closed = false;
+  let deleted = 0;
+  let closed = 0;
   const client = {
     nodeId: null,
     poke: () =>
@@ -57,7 +57,7 @@ test("stopping during startup closes the Airlock client and pinned transport", a
         rejectPoke = reject;
       }),
     delete: async () => {
-      deleted = true;
+      deleted++;
       rejectPoke(new Error("channel deleted"));
     },
   } as unknown as Urbit;
@@ -69,7 +69,7 @@ test("stopping during startup closes the Airlock client and pinned transport", a
           headers: { "set-cookie": "urbauth-~sampel-palnet=session-secret; Path=/; HttpOnly" },
         })) as typeof fetch,
       close: async () => {
-        closed = true;
+        closed++;
       },
     }),
     createClient: () => client,
@@ -78,6 +78,33 @@ test("stopping during startup closes the Airlock client and pinned transport", a
   await new Promise((resolve) => setImmediate(resolve));
   await connection.stop();
   await assert.rejects(starting, /channel deleted/);
-  assert.equal(deleted, true);
-  assert.equal(closed, true);
+  assert.equal(deleted, 1);
+  assert.equal(closed, 1);
+});
+
+test("stopping remains bounded when Airlock cleanup never settles", async () => {
+  const never = new Promise<never>(() => {});
+  const client = {
+    nodeId: null,
+    poke: () => never,
+    delete: () => never,
+  } as unknown as Urbit;
+  const connection = new TlonConnection(installation, async () => {}, {
+    createTransport: async () => ({
+      fetch: (async () =>
+        new Response(null, {
+          status: 204,
+          headers: { "set-cookie": "urbauth-~sampel-palnet=session-secret; Path=/; HttpOnly" },
+        })) as typeof fetch,
+      close: () => never,
+    }),
+    createClient: () => client,
+    cleanupTimeoutMs: 10,
+  });
+  void connection.start().catch(() => undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  await Promise.race([
+    connection.stop(),
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("stop remained blocked")), 100)),
+  ]);
 });

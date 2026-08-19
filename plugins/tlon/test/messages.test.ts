@@ -194,4 +194,6 @@ test("ship transports reject internal addresses and pin public DNS results", asy
     { address: "93.184.216.34", family: 4 },
   ]);
   await transport.close();
+  const ipv6 = await createPinnedOriginFetch("https://[2606:4700:4700::1111]");
+  await ipv6.close();
 });

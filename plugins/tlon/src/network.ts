@@ -47,8 +47,12 @@ export async function createPinnedOriginFetch(
   lookupFn: LookupAll = lookup,
 ): Promise<PinnedOriginFetch> {
   const origin = new URL(baseUrl).origin;
-  const hostname = new URL(origin).hostname;
-  const addresses = await lookupFn(hostname, { all: true, verbatim: true });
+  const rawHostname = new URL(origin).hostname;
+  const hostname = rawHostname.startsWith("[") && rawHostname.endsWith("]") ? rawHostname.slice(1, -1) : rawHostname;
+  const literal = ipaddr.isValid(hostname) ? ipaddr.parse(hostname) : null;
+  const addresses = literal
+    ? [{ address: hostname, family: literal.kind() === "ipv4" ? 4 : 6 }]
+    : await lookupFn(hostname, { all: true, verbatim: true });
   if (!addresses.length || addresses.some((address) => !publicAddress(address.address))) {
     throw new Error("Tlon ship URL must resolve only to public network addresses");
   }
@@ -59,6 +63,6 @@ export async function createPinnedOriginFetch(
   }) as typeof fetch;
   return {
     fetch: guardedFetch,
-    close: () => dispatcher.close(),
+    close: () => dispatcher.destroy(),
   };
 }
