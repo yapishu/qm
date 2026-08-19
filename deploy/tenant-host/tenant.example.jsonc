@@ -1,0 +1,22 @@
+{
+  "contract": 1,
+  "orgId": "acme",
+  "publicUrl": "https://acme.example.com",
+  "target": "docker",
+  "basePort": 18080,
+  "services": ["core", "web-ui", "admin", "portal"],
+  "plugins": [],
+  "skills": [],
+  "sandbox": {
+    "backend": "local",
+    "image": "ghcr.io/example/qm-sandbox@sha256:replace-with-manifest-digest",
+  },
+  "env": {
+    "core": {
+      "HARNESS": "pi",
+      "LOCAL_SANDBOX_CPUS": "1",
+      "LOCAL_SANDBOX_MEMORY_MB": "1024",
+    },
+  },
+  "imageOverrides": {},
+}

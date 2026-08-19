@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QM Tenant Host</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">QM OPERATIONS</p>
+          <h1>Tenant host</h1>
+          <p id="summary" class="summary">Connecting to the host controller…</p>
+        </div>
+        <div class="header-actions">
+          <button id="gateway" class="secondary">Reconcile gateway</button>
+          <button id="refresh">Refresh</button>
+        </div>
+      </header>
+      <section id="gateway-card" class="gateway-card" aria-live="polite"></section>
+      <section>
+        <div class="section-heading">
+          <h2>Companies</h2>
+          <span id="updated"></span>
+        </div>
+        <div id="tenants" class="tenant-grid"></div>
+      </section>
+    </main>
+    <dialog id="auth-dialog">
+      <form id="auth-form">
+        <p class="eyebrow">OPERATOR ACCESS</p>
+        <h2>Connect to this host</h2>
+        <p>Enter the host admin token. It stays in this browser tab.</p>
+        <label>
+          Admin token
+          <input id="token" type="password" autocomplete="off" minlength="32" required />
+        </label>
+        <button type="submit">Connect</button>
+      </form>
+    </dialog>
+    <dialog id="logs-dialog" class="logs-dialog">
+      <div class="logs-heading">
+        <div>
+          <p class="eyebrow">CORE LOGS</p>
+          <h2 id="logs-title"></h2>
+        </div>
+        <button id="close-logs" class="secondary">Close</button>
+      </div>
+      <pre id="logs"></pre>
+    </dialog>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

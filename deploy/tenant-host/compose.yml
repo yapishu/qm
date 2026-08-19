@@ -1,0 +1,24 @@
+services:
+  host:
+    build:
+      context: ../..
+      dockerfile: deploy/tenant-host/Dockerfile
+    container_name: qm-tenant-host
+    environment:
+      QM_HOST_ADMIN_TOKEN: ${QM_HOST_ADMIN_TOKEN:?set QM_HOST_ADMIN_TOKEN}
+      XDG_CONFIG_HOME: /var/lib/qm-host/config
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${QM_TENANT_ROOT:?set QM_TENANT_ROOT}:${QM_TENANT_ROOT:?set QM_TENANT_ROOT}
+      - qm-tenant-host-state:/var/lib/qm-host
+    working_dir: ${QM_TENANT_ROOT:?set QM_TENANT_ROOT}
+
+volumes:
+  qm-tenant-host-state:

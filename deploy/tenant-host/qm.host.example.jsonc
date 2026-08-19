@@ -1,0 +1,9 @@
+{
+  "contract": 1,
+  "id": "production",
+  "gateway": {
+    "image": "caddy:2-alpine@sha256:replace-with-manifest-digest",
+    "email": "ops@example.com",
+  },
+  "tenants": [{ "config": "tenants/acme/qm.config.jsonc" }, { "config": "tenants/globex/qm.config.jsonc" }],
+}
