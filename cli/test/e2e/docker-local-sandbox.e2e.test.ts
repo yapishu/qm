@@ -64,6 +64,7 @@ test(
   { skip: lifecycleSkip() },
   () => {
     const image = localImageId()!;
+    const runtimeImage = `qm-sandbox-local:${image.slice("sha256:".length)}`;
     const org = `qm-e2e-local-${process.pid}`;
     const dep = tmp("local-sandbox");
     const stateRoot = join(dep, "state");
@@ -102,6 +103,13 @@ test(
       assert.match(coreEnv, /^DOCKER_HOST=tcp:\/\/docker:2376$/m);
       assert.match(coreEnv, /^DOCKER_TLS_VERIFY=1$/m);
       assert.match(coreEnv, /^DOCKER_CERT_PATH=\/certs\/client$/m);
+      const nestedImageId = execFileSync(
+        "docker",
+        ["exec", daemon, "docker", "image", "inspect", "-f", "{{.Id}}", runtimeImage],
+        { encoding: "utf8" },
+      ).trim();
+      assert.match(nestedImageId, /^sha256:[0-9a-f]{64}$/);
+      assert.match(coreEnv, new RegExp(`^LOCAL_SANDBOX_IMAGE=${nestedImageId}$`, "m"));
       const deploymentState = JSON.parse(
         readFileSync(join(stateRoot, "qm", "deployments", org, "state.json"), "utf8"),
       ) as { sandboxAgentSecret?: string };
@@ -118,7 +126,6 @@ test(
       );
       assert.doesNotMatch(coreMounts, /docker\.sock/);
       execFileSync("docker", ["exec", core, "test", "-s", "/certs/client/cert.pem"]);
-      execFileSync("docker", ["exec", daemon, "docker", "image", "inspect", image], { stdio: "ignore" });
       execFileSync("docker", [
         "exec",
         daemon,
@@ -133,7 +140,7 @@ test(
         "host.docker.internal:host-gateway",
         "-p",
         "0.0.0.0:0:8080",
-        image,
+        nestedImageId,
       ]);
       execFileSync("docker", [
         "exec",
@@ -149,7 +156,7 @@ test(
         "host.docker.internal:host-gateway",
         "-p",
         "0.0.0.0:0:8080",
-        image,
+        nestedImageId,
       ]);
       const published = execFileSync("docker", ["exec", daemon, "docker", "port", "qm-probe-b", "8080/tcp"], {
         encoding: "utf8",

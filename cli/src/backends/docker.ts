@@ -64,6 +64,7 @@ interface DockerCtx {
   databaseUrl: string;
   signingSecret?: string;
   sandboxAgentSecret?: string;
+  sandboxRuntimeImage?: string;
   envFile?: string;
   sandboxEnv: Record<string, string>;
   sandboxSecretKeys: Set<string>;
@@ -371,7 +372,7 @@ function serviceEnv(ctx: DockerCtx, service: ServiceName): Record<string, string
     env.DATABASE_URL = ctx.databaseUrl;
     if (config.sandbox?.backend === "local") {
       env.SANDBOX_BACKEND = "local";
-      env.LOCAL_SANDBOX_IMAGE = config.sandbox.image!;
+      env.LOCAL_SANDBOX_IMAGE = ctx.sandboxRuntimeImage ?? config.sandbox.image!;
       env.DOCKER_HOST = "tcp://docker:2376";
       env.DOCKER_TLS_VERIFY = "1";
       env.DOCKER_CERT_PATH = "/certs/client";
@@ -386,6 +387,10 @@ function serviceEnv(ctx: DockerCtx, service: ServiceName): Record<string, string
     }
   }
   return env;
+}
+
+function localSandboxImportReference(image: string): string {
+  return isDockerImageId(image) ? `qm-sandbox-local:${image.slice("sha256:".length)}` : image;
 }
 
 function secretEnvKeys(ctx: DockerCtx, service: string): Set<string> {
@@ -531,7 +536,7 @@ async function waitSandboxDocker(ctx: DockerCtx): Promise<void> {
   throw new CliError("tenant sandbox Docker daemon did not become ready in 60s");
 }
 
-function loadLocalSandboxImage(ctx: DockerCtx): void {
+function loadLocalSandboxImage(ctx: DockerCtx): string {
   const image = ctx.config.sandbox?.image;
   if (!image) throw new CliError('sandbox.backend "local" requires sandbox.image');
   const name = sandboxDockerName(ctx);
@@ -539,8 +544,9 @@ function loadLocalSandboxImage(ctx: DockerCtx): void {
     step(`pulling ${image} into ${name}`);
     dockerInherit(["exec", name, "docker", "pull", image], `failed to pull digest-pinned sandbox image ${image}`);
     docker(["exec", name, "docker", "image", "inspect", image]);
-    return;
+    return image;
   }
+  const runtimeImage = localSandboxImportReference(image);
   let outerId = capture("docker", ["image", "inspect", "-f", "{{.Id}}", image], { allow: /No such image/i }).trim();
   if (!outerId || /No such image/i.test(outerId)) {
     if (isDockerImageId(image)) {
@@ -551,15 +557,17 @@ function loadLocalSandboxImage(ctx: DockerCtx): void {
     dockerInherit(["pull", image], `failed to pull local sandbox image ${image}`);
     outerId = docker(["image", "inspect", "-f", "{{.Id}}", image]).trim();
   }
-  const nestedId = capture("docker", ["exec", name, "docker", "image", "inspect", "-f", "{{.Id}}", image], {
+  const nestedId = capture("docker", ["exec", name, "docker", "image", "inspect", "-f", "{{.Id}}", runtimeImage], {
     allow: /No such image|No such object/i,
   }).trim();
-  if (nestedId === outerId) return;
+  if (isDockerImageId(image) && isDockerImageId(nestedId)) return nestedId;
+  if (!isDockerImageId(image) && nestedId === outerId) return image;
+  if (isDockerImageId(image)) docker(["tag", image, runtimeImage]);
   const dir = mkdtempSync(join(tmpdir(), "qm-sandbox-image-"));
   const archive = join(dir, "image.tar");
   try {
-    step(`loading ${image} into ${name}`);
-    dockerInherit(["image", "save", "-o", archive, image]);
+    step(`loading ${runtimeImage} into ${name}`);
+    dockerInherit(["image", "save", "-o", archive, runtimeImage]);
     const input = openSync(archive, "r");
     try {
       execFileSync("docker", ["exec", "-i", name, "docker", "load"], { stdio: [input, "inherit", "inherit"] });
@@ -569,6 +577,8 @@ function loadLocalSandboxImage(ctx: DockerCtx): void {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  const loadedId = docker(["exec", name, "docker", "image", "inspect", "-f", "{{.Id}}", runtimeImage]).trim();
+  return isDockerImageId(image) ? loadedId : image;
 }
 
 async function ensureSandboxDocker(ctx: DockerCtx): Promise<void> {
@@ -600,7 +610,7 @@ async function ensureSandboxDocker(ctx: DockerCtx): Promise<void> {
     LOCAL_SANDBOX_DOCKER_IMAGE,
   ]);
   await waitSandboxDocker(ctx);
-  loadLocalSandboxImage(ctx);
+  ctx.sandboxRuntimeImage = loadLocalSandboxImage(ctx);
   ok("tenant sandbox daemon ready");
 }
 
