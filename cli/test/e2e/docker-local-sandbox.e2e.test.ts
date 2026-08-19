@@ -17,20 +17,19 @@ import {
   writeConfig,
 } from "./harness.ts";
 
-const image = "qm-sandbox-local:latest";
+const imageTag = "qm-sandbox-local:latest";
 
-function imageAvailable(): boolean {
+function localImageId(): string | undefined {
   try {
-    execFileSync("docker", ["image", "inspect", image], { stdio: "ignore" });
-    return true;
+    return execFileSync("docker", ["image", "inspect", "-f", "{{.Id}}", imageTag], { encoding: "utf8" }).trim();
   } catch {
-    return false;
+    return undefined;
   }
 }
 
 function lifecycleSkip(): string | false {
   if (!dockerAvailable()) return "no Docker daemon reachable";
-  if (!imageAvailable()) return `no ${image}; run npm run sandbox:local:build`;
+  if (!localImageId()) return `no ${imageTag}; run npm run sandbox:local:build`;
   if (preexistingServiceImages(["core"]).length) return "refusing to clobber qm-core:local";
   return false;
 }
@@ -64,6 +63,7 @@ test(
   "docker local sandbox uses a private nested daemon reachable only through the tenant network",
   { skip: lifecycleSkip() },
   () => {
+    const image = localImageId()!;
     const org = `qm-e2e-local-${process.pid}`;
     const dep = tmp("local-sandbox");
     const stateRoot = join(dep, "state");

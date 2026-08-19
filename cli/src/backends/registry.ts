@@ -177,7 +177,7 @@ const docker: HostingProvider = {
   publishSandbox: (ctx, opts) => {
     if (ctx.config.sandbox?.backend === "local") {
       throw new CliError(
-        `sandbox publish is not used with sandbox.backend "local"; build the agent image with npm run sandbox:local:build, push it to a registry, and set sandbox.image to its digest`,
+        `sandbox publish is not used with sandbox.backend "local"; build the agent image with npm run sandbox:local:build, then set sandbox.image to its bare local image ID or push it to a registry and use its digest`,
       );
     }
     return publishFlySandbox(ctx, opts, false);

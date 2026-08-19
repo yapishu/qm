@@ -85,6 +85,22 @@ test("tenant host rejects overlapping service ports and mutable gateway images",
   }
 });
 
+test("tenant host accepts local sandbox image IDs and rejects mutable sandbox tags", () => {
+  const fixture = hostFixture();
+  try {
+    const configPath = join(fixture.dir, "tenants", "acme", "qm.config.jsonc");
+    const raw = JSON.parse(readFileSync(configPath, "utf8")) as { sandbox: { image: string } };
+    raw.sandbox.image = DIGEST;
+    writeFileSync(configPath, JSON.stringify(raw));
+    assert.equal(loadTenantHostConfig(fixture.path).tenants[0]?.config.sandbox?.image, DIGEST);
+    raw.sandbox.image = "qm-sandbox-local:latest";
+    writeFileSync(configPath, JSON.stringify(raw));
+    assert.throws(() => loadTenantHostConfig(fixture.path), /registry digest.*local Docker image ID/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test("tenant host rejects controller ports and allocations beyond the TCP range", () => {
   const fixture = hostFixture();
   try {

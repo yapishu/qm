@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { isDigestPinned, loadConfigAt, parseJsonc, validOrgId, type QmConfig } from "../config.ts";
+import { isDigestPinned, isDockerImageId, loadConfigAt, parseJsonc, validOrgId, type QmConfig } from "../config.ts";
 import { CliError, errMessage } from "../log.ts";
 import { runnableServices, serviceDef } from "../services.ts";
 
@@ -58,8 +58,11 @@ function tenantOf(raw: unknown, index: number, hostDir: string): TenantHostTenan
   if (loaded.config.sandbox?.backend !== "local") {
     throw new CliError(`${configPath}: tenant host deployments must set sandbox.backend to "local"`);
   }
-  if (!loaded.config.sandbox.image || !isDigestPinned(loaded.config.sandbox.image)) {
-    throw new CliError(`${configPath}: tenant host sandbox.image must be an immutable image reference`);
+  const sandboxImage = loaded.config.sandbox.image;
+  if (!sandboxImage || (!isDigestPinned(sandboxImage) && !isDockerImageId(sandboxImage))) {
+    throw new CliError(
+      `${configPath}: tenant host sandbox.image must be a registry digest ending in @sha256:<digest> or a local Docker image ID sha256:<digest>`,
+    );
   }
   const publicUrl = new URL(loaded.config.publicUrl);
   if (publicUrl.protocol !== "https:" || publicUrl.port || publicUrl.pathname !== "/") {

@@ -31,7 +31,14 @@ import {
   type LogOpts,
   type ServiceName,
 } from "../services.ts";
-import { dockerBasePort, isDigestPinned, sandboxCoreEnv, securityScreenEnv, type QmConfig } from "../config.ts";
+import {
+  dockerBasePort,
+  isDigestPinned,
+  isDockerImageId,
+  sandboxCoreEnv,
+  securityScreenEnv,
+  type QmConfig,
+} from "../config.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
 import { computedSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
 import { acquireDeploymentLock, readDeploymentState, writeDeploymentState, type DeploymentState } from "../state.ts";
@@ -536,6 +543,11 @@ function loadLocalSandboxImage(ctx: DockerCtx): void {
   }
   let outerId = capture("docker", ["image", "inspect", "-f", "{{.Id}}", image], { allow: /No such image/i }).trim();
   if (!outerId || /No such image/i.test(outerId)) {
+    if (isDockerImageId(image)) {
+      throw new CliError(
+        `local sandbox image ${image} is not in the host Docker image store; build it on this host and record the image ID reported by \`docker image inspect qm-sandbox-local:latest --format '{{.Id}}'\``,
+      );
+    }
     dockerInherit(["pull", image], `failed to pull local sandbox image ${image}`);
     outerId = docker(["image", "inspect", "-f", "{{.Id}}", image]).trim();
   }

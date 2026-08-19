@@ -203,6 +203,8 @@ export const dockerBasePort = (config: QmConfig): number => envNum("QM_BASE_PORT
 
 export const isDigestPinned = (ref: string): boolean => /@sha256:[0-9a-f]{64}$/.test(ref);
 
+export const isDockerImageId = (ref: string): boolean => /^sha256:[0-9a-f]{64}$/.test(ref);
+
 const SANDBOX_PIN_PENDING = `"sandbox.app" is set but no sandbox layer image is pinned; run \`qm sandbox publish\` to build and record the digest-pinned "sandbox.image" agents boot from`;
 
 export const sandboxPinPending = (config: QmConfig): boolean =>

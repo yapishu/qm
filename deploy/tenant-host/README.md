@@ -16,7 +16,7 @@ Create one normal Docker deployment directory per company and give each one a di
 }
 ```
 
-Each tenant must select the local sandbox backend and a digest-pinned agent image:
+Each tenant must select the local sandbox backend and either a digest-pinned registry image or a bare local Docker image ID:
 
 ```json
 {
@@ -33,7 +33,16 @@ Each tenant must select the local sandbox backend and a digest-pinned agent imag
 }
 ```
 
-Build the sandbox agent image once, push it to a registry, and record its immutable digest in each tenant config:
+For a single test host, build the sandbox agent image on that host and record its bare image ID in each tenant config:
+
+```bash
+npm run sandbox:local:build
+docker image inspect qm-sandbox-local:latest --format '{{.Id}}'
+```
+
+The result has the form `sha256:<digest>`. Use that exact value as `sandbox.image`, without an image name or `@`. The controller copies the local image into every tenant's nested daemon.
+
+For a portable deployment, push the image to a public registry and record its immutable registry digest instead:
 
 ```bash
 npm run sandbox:local:build
@@ -42,7 +51,7 @@ docker push ghcr.io/example/qm-sandbox:2026-08-18
 docker buildx imagetools inspect ghcr.io/example/qm-sandbox:2026-08-18
 ```
 
-The nested daemons pull digest-pinned images directly and do not currently receive private-registry credentials, so the recorded sandbox image must be anonymously pullable.
+The nested daemons pull registry-digest images directly and do not currently receive private-registry credentials, so a recorded registry image must be anonymously pullable. Bare local image IDs are loaded from the host Docker image store and therefore do not use a registry.
 
 The host loads that image into a dedicated nested Docker daemon for each tenant. Tenant cores never receive the host Docker socket or another tenant's daemon endpoint. The daemon requires mutual TLS, and only that tenant's core receives the client certificate; agent containers can reach the daemon network address but cannot authenticate to its API. Agent execution endpoints require unique per-container bearer credentials derived from a tenant-scoped secret. Sandbox daemon state, certificates, and the credential root are retained in tenant-scoped durable state.
 

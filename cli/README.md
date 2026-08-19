@@ -71,8 +71,9 @@ so it prints that snapshot as the matching data restore point
 pruned to a bounded count; `aws.predeployDbSnapshot: false` opts out.
 
 `sandbox build` is a local validation build. With Docker `sandbox.backend: "local"`,
-the operator pushes that image to a registry and records its digest as `sandbox.image`;
-`qm up` loads it into the deployment's tenant-local sandbox daemon. `sandbox publish`
+the operator either records the built image's bare `sha256:…` ID for a single host or
+pushes it to a registry and records its digest as `sandbox.image`; `qm up` loads it into
+the deployment's tenant-local sandbox daemon. `sandbox publish`
 pushes through the configured Fly-compatible OCI registry, resolves the image and base
 digests, records the base pin in the config and the image pin in the config or durable
 AWS deployment manifest, syncs the durable deployment layer when core is reachable,
