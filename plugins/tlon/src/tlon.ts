@@ -7,7 +7,9 @@ import {
   type ChannelStatus,
   type Story,
 } from "@tloncorp/api";
+import { swallow } from "../../chassis/src/errors.ts";
 import { parseChannelMessage, parseDmMessage, dmInvites } from "./messages.ts";
+import { createPinnedOriginFetch, type PinnedOriginFetch } from "./network.ts";
 import type { Delivery, Installation } from "./types.ts";
 import { decodeDeliveryTarget } from "./target.ts";
 
@@ -44,7 +46,7 @@ export async function authenticateShip(
     body: new URLSearchParams({ password: code }).toString(),
     signal: AbortSignal.timeout(30_000),
   });
-  await response.text();
+  await response.body?.cancel().catch((error) => swallow("cancel Tlon login response", error));
   if (!response.ok) throw new Error(`Tlon login failed with HTTP ${response.status}`);
   const expected = `urbauth-${ship}=`;
   const cookie = response.headers
@@ -54,7 +56,7 @@ export async function authenticateShip(
   if (!cookie) throw new Error(`Tlon login did not return the ${expected.slice(0, -1)} cookie`);
   return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const headers = requestHeaders(input, init);
-    if (!headers.has("cookie")) headers.set("cookie", cookie);
+    headers.set("cookie", cookie);
     return lockedFetch(input, { ...init, headers });
   }) as typeof fetch;
 }
@@ -91,16 +93,26 @@ function deliveryTime(delivery: Delivery): number {
 export class TlonConnection {
   readonly installation: Installation;
   private client: Urbit | null = null;
+  private transport: PinnedOriginFetch | null = null;
   private stopped = false;
   private state: { status: "connecting" | "connected" | "error"; message?: string } = { status: "connecting" };
   private readonly seen = new Set<string>();
   private readonly inbound: (message: ReturnType<typeof parseChannelMessage>) => Promise<void>;
+  private readonly createTransport: (baseUrl: string) => Promise<PinnedOriginFetch>;
+  private readonly createClient: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
 
   constructor(
     installation: Installation,
     inbound: (message: NonNullable<ReturnType<typeof parseChannelMessage>>) => Promise<void>,
+    deps: {
+      createTransport?: (baseUrl: string) => Promise<PinnedOriginFetch>;
+      createClient?: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
+    } = {},
   ) {
     this.installation = installation;
+    this.createTransport = deps.createTransport ?? createPinnedOriginFetch;
+    this.createClient =
+      deps.createClient ?? ((baseUrl, fetchImpl) => new Urbit(baseUrl, undefined, undefined, fetchImpl));
     this.inbound = async (message) => {
       if (!message || this.seen.has(message.messageId)) return;
       this.seen.add(message.messageId);
@@ -129,65 +141,75 @@ export class TlonConnection {
   }
 
   async start(): Promise<void> {
-    const authenticatedFetch = await authenticateShip(
-      this.installation.url,
-      this.installation.ship,
-      this.installation.code,
-    );
-    const client = new Urbit(this.installation.url, undefined, undefined, authenticatedFetch);
-    client.nodeId = this.installation.ship;
-    await client.poke({ app: "hood", mark: "helm-hi", json: "opening airlock" });
-    await client.eventSource();
-    if (this.stopped) {
-      await client.delete();
-      return;
+    const transport = await this.createTransport(this.installation.url);
+    this.transport = transport;
+    let client: Urbit | null = null;
+    try {
+      const authenticatedFetch = await authenticateShip(
+        this.installation.url,
+        this.installation.ship,
+        this.installation.code,
+        transport.fetch,
+      );
+      if (this.stopped) throw new Error("Tlon connection stopped during startup");
+      client = this.createClient(this.installation.url, authenticatedFetch);
+      client.nodeId = this.installation.ship;
+      this.client = client;
+      await client.poke({ app: "hood", mark: "helm-hi", json: "opening airlock" });
+      await client.eventSource();
+      if (this.stopped) throw new Error("Tlon connection stopped during startup");
+      this.state = { status: "connected" };
+      client.on("status-update", ({ status, context }) => this.updateStatus(status, context?.message));
+      client.on("error", ({ msg }) => {
+        this.state = { status: "error", message: msg };
+      });
+      client.on("subscription", ({ status }) => {
+        if (status === "open" && this.state.status !== "error") this.state = { status: "connected" };
+      });
+      await client.subscribe({
+        app: "channels",
+        path: "/v4",
+        event: (value) => this.receive("channel", value, parseChannelMessage),
+        err: (error) => {
+          this.state = { status: "error", message: String(error) };
+        },
+        quit: () => {
+          this.state = { status: "connecting", message: "channel subscription restarting" };
+        },
+      });
+      await client.subscribe({
+        app: "chat",
+        path: "/v4",
+        event: (value) => {
+          for (const sender of dmInvites(this.installation, value)) {
+            void client!
+              .poke({ app: "chat", mark: "chat-dm-rsvp", json: { ship: sender, ok: true } })
+              .catch((error) =>
+                console.error(
+                  `[tlon] accepting DM invite for ${this.installation.id} failed:`,
+                  error instanceof Error ? error.message : String(error),
+                ),
+              );
+          }
+          this.receive("DM", value, parseDmMessage);
+        },
+        err: (error) => {
+          this.state = { status: "error", message: String(error) };
+        },
+        quit: () => {
+          this.state = { status: "connecting", message: "DM subscription restarting" };
+        },
+      });
+    } catch (error) {
+      await this.release(client, transport);
+      throw error;
     }
-    this.client = client;
-    this.state = { status: "connected" };
-    client.on("status-update", ({ status, context }) => this.updateStatus(status, context?.message));
-    client.on("subscription", ({ status }) => {
-      if (status === "open" && this.state.status !== "error") this.state = { status: "connected" };
-    });
-    await client.subscribe({
-      app: "channels",
-      path: "/v4",
-      event: (value) => this.receive("channel", value, parseChannelMessage),
-      err: (error) => {
-        this.state = { status: "error", message: String(error) };
-      },
-      quit: () => {
-        this.state = { status: "connecting", message: "channel subscription restarting" };
-      },
-    });
-    await client.subscribe({
-      app: "chat",
-      path: "/v4",
-      event: (value) => {
-        for (const sender of dmInvites(this.installation, value)) {
-          void client
-            .poke({ app: "chat", mark: "chat-dm-rsvp", json: { ship: sender, ok: true } })
-            .catch((error) =>
-              console.error(
-                `[tlon] accepting DM invite for ${this.installation.id} failed:`,
-                error instanceof Error ? error.message : String(error),
-              ),
-            );
-        }
-        this.receive("DM", value, parseDmMessage);
-      },
-      err: (error) => {
-        this.state = { status: "error", message: String(error) };
-      },
-      quit: () => {
-        this.state = { status: "connecting", message: "DM subscription restarting" };
-      },
-    });
   }
 
   private updateStatus(status: ChannelStatus, message?: string): void {
     if (status === "active" || status === "reconnected") this.state = { status: "connected" };
     else if (status === "errored") this.state = { status: "error", ...(message ? { message } : {}) };
-    else this.state = { status: "connecting", ...(message ? { message } : {}) };
+    else if (this.state.status !== "error") this.state = { status: "connecting", ...(message ? { message } : {}) };
   }
 
   runtimeStatus(): { status: "connecting" | "connected" | "error"; message?: string } {
@@ -225,7 +247,15 @@ export class TlonConnection {
   async stop(): Promise<void> {
     this.stopped = true;
     const client = this.client;
-    this.client = null;
-    if (client) await client.delete();
+    const transport = this.transport;
+    await this.release(client, transport);
+  }
+
+  private async release(client: Urbit | null, transport: PinnedOriginFetch | null): Promise<void> {
+    if (this.client === client) this.client = null;
+    if (this.transport === transport) this.transport = null;
+    if (client) await client.delete().catch((error) => swallow(`delete Tlon channel ${this.installation.id}`, error));
+    if (transport)
+      await transport.close().catch((error) => swallow(`close Tlon transport ${this.installation.id}`, error));
   }
 }

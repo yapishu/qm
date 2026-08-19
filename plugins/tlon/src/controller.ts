@@ -2,6 +2,20 @@ import { decodeDeliveryTarget } from "./target.ts";
 import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { CoreClient } from "./core.ts";
 import { TlonConnection } from "./tlon.ts";
+import type { Delivery, InboundMessage, Installation } from "./types.ts";
+
+interface ManagedConnection {
+  readonly installation: Installation;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  runtimeStatus(): { status: "connecting" | "connected" | "error"; message?: string };
+  deliver(delivery: Delivery): Promise<void>;
+}
+
+type ConnectionFactory = (
+  installation: Installation,
+  inbound: (message: InboundMessage) => Promise<void>,
+) => ManagedConnection;
 
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -32,13 +46,19 @@ async function within<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 export class TlonController {
   private readonly core: CoreClient;
-  private readonly connections = new Map<string, TlonConnection>();
+  private readonly connectionFactory: ConnectionFactory;
+  private readonly connections = new Map<string, ManagedConnection>();
   private readonly abort = new AbortController();
   private reconcileTask: Promise<void> | null = null;
   private deliveryTask: Promise<void> | null = null;
+  private readonly retries = new Map<string, { version: string; at: number; delay: number }>();
 
-  constructor(core: CoreClient) {
+  constructor(
+    core: CoreClient,
+    connectionFactory: ConnectionFactory = (installation, inbound) => new TlonConnection(installation, inbound),
+  ) {
     this.core = core;
+    this.connectionFactory = connectionFactory;
   }
 
   start(): void {
@@ -54,6 +74,7 @@ export class TlonController {
   private async reconcile(): Promise<void> {
     const installations = await this.core.installations();
     const desired = new Map(installations.map((installation) => [installation.id, installation]));
+    for (const id of this.retries.keys()) if (!desired.has(id)) this.retries.delete(id);
     for (const [id, connection] of this.connections) {
       const next = desired.get(id);
       if (next?.version === connection.installation.version) {
@@ -62,33 +83,52 @@ export class TlonController {
           .report(id, next.version, runtime.status, runtime.message)
           .catch((error) => swallow(`report Tlon connection ${id}`, error));
         if (runtime.status !== "error") continue;
+        this.scheduleRetry(id, next.version);
       }
       this.connections.delete(id);
       await connection.stop().catch((error) => swallow(`stop Tlon connection ${id}`, error));
-      await this.core
-        .report(id, connection.installation.version, "stopped")
-        .catch((error) => swallow(`report stopped Tlon connection ${id}`, error));
+      if (!next || next.version !== connection.installation.version)
+        await this.core
+          .report(id, connection.installation.version, "stopped")
+          .catch((error) => swallow(`report stopped Tlon connection ${id}`, error));
     }
     await Promise.all(
       installations
-        .filter((installation) => !this.connections.has(installation.id))
+        .filter((installation) => {
+          if (this.connections.has(installation.id)) return false;
+          const retry = this.retries.get(installation.id);
+          if (!retry || retry.version !== installation.version) {
+            this.retries.delete(installation.id);
+            return true;
+          }
+          return retry.at <= Date.now();
+        })
         .map(async (installation) => {
           await this.core.report(installation.id, installation.version, "connecting");
-          const connection = new TlonConnection(installation, (message) => this.core.turn(message));
+          const connection = this.connectionFactory(installation, (message) => this.core.turn(message));
           try {
             await within(connection.start(), 30_000);
-            this.connections.set(installation.id, connection);
             await this.core.report(installation.id, installation.version, "connected");
+            this.connections.set(installation.id, connection);
+            this.retries.delete(installation.id);
           } catch (error) {
+            this.connections.delete(installation.id);
             await connection
               .stop()
               .catch((stopError) => swallow(`stop failed Tlon connection ${installation.id}`, stopError));
             const message = errMessage(error);
             console.error(`[tlon] connection ${installation.id} failed: ${message}`);
+            this.scheduleRetry(installation.id, installation.version);
             await this.core.report(installation.id, installation.version, "error", message);
           }
         }),
     );
+  }
+
+  private scheduleRetry(id: string, version: string): void {
+    const previous = this.retries.get(id);
+    const delay = previous?.version === version ? Math.min(previous.delay * 2, 300_000) : 5_000;
+    this.retries.set(id, { version, delay, at: Date.now() + delay });
   }
 
   private async reconcileLoop(): Promise<void> {

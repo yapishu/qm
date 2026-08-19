@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { dmInvites, parseChannelMessage, parseDmMessage } from "../src/messages.ts";
+import { createPinnedOriginFetch, publicAddress } from "../src/network.ts";
 import { decodeDeliveryTarget, encodeDeliveryTarget } from "../src/target.ts";
 import type { Installation } from "../src/types.ts";
 import { authenticateShip, originLockedFetch } from "../src/tlon.ts";
@@ -153,7 +154,11 @@ test("ship authentication exchanges the login code for an origin-bound urbauth c
     "code with + and spaces",
     fetchImpl,
   );
-  await authenticatedFetch(`${installation.url}/~/channel/1`, { method: "PUT", body: "[]" });
+  await authenticatedFetch(`${installation.url}/~/channel/1`, {
+    method: "PUT",
+    headers: { cookie: "undefined" },
+    body: "[]",
+  });
   assert.deepEqual(calls, [
     {
       url: "https://ship.example.com/~/login",
@@ -170,4 +175,23 @@ test("ship authentication exchanges the login code for an origin-bound urbauth c
       cookie: "urbauth-~sampel-palnet=session-secret",
     },
   ]);
+});
+
+test("ship transports reject internal addresses and pin public DNS results", async () => {
+  assert.equal(publicAddress("8.8.8.8"), true);
+  assert.equal(publicAddress("2606:4700:4700::1111"), true);
+  for (const address of ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fc00::1", "::ffff:127.0.0.1"])
+    assert.equal(publicAddress(address), false);
+  await assert.rejects(
+    () =>
+      createPinnedOriginFetch("https://ship.example.com", async () => [
+        { address: "93.184.216.34", family: 4 },
+        { address: "127.0.0.1", family: 4 },
+      ]),
+    /public network addresses/,
+  );
+  const transport = await createPinnedOriginFetch("https://ship.example.com", async () => [
+    { address: "93.184.216.34", family: 4 },
+  ]);
+  await transport.close();
 });
