@@ -162,6 +162,7 @@ export class TlonConnection {
     this.transport = transport;
     let client: Urbit | null = null;
     try {
+      if (this.stopped) throw new Error("Tlon connection stopped during startup");
       const authenticatedFetch = await authenticateShip(
         this.installation.url,
         this.installation.ship,

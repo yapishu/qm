@@ -82,6 +82,35 @@ test("stopping during startup closes the Airlock client and pinned transport", a
   assert.equal(closed, 1);
 });
 
+test("stopping before transport creation finishes never submits the login code", async () => {
+  let resolveTransport = (_transport: { fetch: typeof fetch; close: () => Promise<void> }): void => {};
+  const transportCreated = new Promise<{
+    fetch: typeof fetch;
+    close: () => Promise<void>;
+  }>((resolve) => {
+    resolveTransport = resolve;
+  });
+  let fetched = 0;
+  let closed = 0;
+  const connection = new TlonConnection(installation, async () => {}, {
+    createTransport: () => transportCreated,
+  });
+  const starting = connection.start();
+  await connection.stop();
+  resolveTransport({
+    fetch: (async () => {
+      fetched++;
+      return new Response(null, { status: 204 });
+    }) as typeof fetch,
+    close: async () => {
+      closed++;
+    },
+  });
+  await assert.rejects(starting, /stopped during startup/);
+  assert.equal(fetched, 0);
+  assert.equal(closed, 1);
+});
+
 test("stopping remains bounded when Airlock cleanup never settles", async () => {
   const never = new Promise<never>(() => {});
   const client = {
