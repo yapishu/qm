@@ -473,6 +473,17 @@ async function relayCap(res: ServerResponse, method: HttpMethod, pathWithQuery: 
   relay(res, await coreFetchCap(method, pathWithQuery, rawBody));
 }
 
+function tlonConnectionBody(p: Record<string, unknown>): string {
+  return JSON.stringify({
+    ship: typeof p.ship === "string" ? p.ship : "",
+    url: typeof p.url === "string" ? p.url : "",
+    code: typeof p.code === "string" ? p.code : "",
+    ownerShip: typeof p.ownerShip === "string" ? p.ownerShip : "",
+    channels: Array.isArray(p.channels) ? p.channels.filter((value) => typeof value === "string") : [],
+    respondWithoutMention: p.respondWithoutMention === true,
+  });
+}
+
 /**
  * Read and parse a JSON object body, or answer 400 and return null — a null
  * return always means the response has been sent. Only plain objects come
@@ -1442,6 +1453,38 @@ const apiRoutes: readonly WebRoute[] = [
       if (!provider && !host) return json(res, 400, { error: "bad_request", message: "provider or host required" });
       const rawBody = JSON.stringify({ principalId: user, ...(provider ? { provider } : { host }) });
       return relayCore(res, "POST", "/v1/connectors/oauth/revoke", rawBody);
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/tlon/connections",
+    handle: async (c) => {
+      return relayCore(c.res, "GET", "/v1/tlon/connections");
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/tlon/connections",
+    handle: async (c) => {
+      const p = await readJson<Record<string, unknown>>(c.req, c.res, false);
+      if (!p) return;
+      return relayCore(c.res, "POST", "/v1/tlon/connections", tlonConnectionBody(p));
+    },
+  },
+  {
+    method: "PUT",
+    path: "/api/tlon/connections/:id",
+    handle: async (c) => {
+      const p = await readJson<Record<string, unknown>>(c.req, c.res, false);
+      if (!p) return;
+      return relayCore(c.res, "PUT", `/v1/tlon/connections/${encodeURIComponent(c.params.id!)}`, tlonConnectionBody(p));
+    },
+  },
+  {
+    method: "DELETE",
+    path: "/api/tlon/connections/:id",
+    handle: async (c) => {
+      return relayCore(c.res, "DELETE", `/v1/tlon/connections/${encodeURIComponent(c.params.id!)}`);
     },
   },
   {

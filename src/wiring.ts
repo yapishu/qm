@@ -278,6 +278,7 @@ import { createPostgresMetricsSink } from "./admin/postgres-metrics-sink.ts";
 import { errMessage, swallowAs } from "./util/errors.ts";
 import { sleep } from "./util/async.ts";
 import { createSlackInstallationStore, type SlackInstallationStore } from "./surfaces/slack-installation.ts";
+import { createTlonInstallationStore, type TlonInstallationStore } from "./surfaces/tlon-installation.ts";
 
 export interface Runtime {
   start(): void;
@@ -326,6 +327,7 @@ export interface BuiltApp {
   config: ScopedConfigStore;
   connectorTokens: ConnectorTokenStore;
   slackInstallation: SlackInstallationStore;
+  tlonInstallations: TlonInstallationStore;
   resolveClient: OAuthClientResolver;
   consentLinks: ConsentLinkStore;
   secretDrops: SecretDropStore;
@@ -476,6 +478,11 @@ export function buildApp(
   const slackInstallation = createSlackInstallationStore(
     config.orgId,
     artifactMap("slack_installation"),
+    config.connectorSecretKey ?? randomBytes(32),
+  );
+  const tlonInstallations = createTlonInstallationStore(
+    config.orgId,
+    artifactMap("tlon_installations"),
     config.connectorSecretKey ?? randomBytes(32),
   );
   const deploymentLayer = config.deploymentLayerDir
@@ -1498,6 +1505,7 @@ export function buildApp(
     config: configStore,
     connectorTokens,
     slackInstallation,
+    tlonInstallations,
     resolveClient,
     consentLinks,
     secretDrops,
@@ -1581,6 +1589,7 @@ export function serverDeps(
     harnessId: config.harness,
     connectorTokens: built.connectorTokens,
     slackInstallation: built.slackInstallation,
+    tlonInstallations: built.tlonInstallations,
     slackEnvironmentState,
     ...(slackEnvBotToken ? { slackEnvBotToken } : {}),
     resolveClient: built.resolveClient,

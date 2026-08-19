@@ -98,6 +98,26 @@ test("plan --build-from <path> shows local builds instead of registry pulls", ()
   }
 });
 
+test("plan --build-from builds a bundled image plugin from deploy/<name>/Dockerfile", () => {
+  const dir = tmp("plan-buildfrom-plugin");
+  const checkout = standInCheckout(["core", "tlon"]);
+  try {
+    writeConfig(dir, {
+      orgId: "acme",
+      target: "docker",
+      services: ["core"],
+      plugins: [{ name: "tlon", image: "sha256:" + "a".repeat(64) }],
+    });
+    const r = runCli(["plan", "--build-from", checkout], { cwd: dir });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /plugin tlon: build deploy\/tlon\/Dockerfile/);
+    assert.doesNotMatch(r.out, /plugin tlon: pull/);
+  } finally {
+    rmDir(dir);
+    rmDir(checkout);
+  }
+});
+
 test("bare plan --build-from builds from the enclosing qm checkout", () => {
   const stack = tmp("plan-buildfrom-bare");
   try {

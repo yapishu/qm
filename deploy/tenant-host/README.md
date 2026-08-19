@@ -66,6 +66,32 @@ done
 
 Record the lines for the tenant's configured services in its `imageOverrides`. Later ordinary `host up` operations use those immutable local IDs without rebuilding or contacting a registry.
 
+To enable Tlon for a tenant, add the bundled sidecar as an image plugin:
+
+```json
+{
+  "plugins": [
+    {
+      "name": "tlon",
+      "image": "sha256:<local-image-id>"
+    }
+  ]
+}
+```
+
+Build it with the rest of a local deployment:
+
+```bash
+docker compose -f deploy/tenant-host/compose.yml run --rm host \
+  node /app/cli/bin/qm.ts host up "$QM_TENANT_ROOT/qm.host.jsonc" --build-from "$QM_SOURCE_ROOT"
+
+docker image inspect qm-tlon:local --format '{{.Id}}'
+```
+
+Record that exact local image ID as the plugin image before subsequent ordinary `host up` operations. For the first source build, the plugin entry still needs a syntactically valid immutable image value; `--build-from` replaces it with the bundled `deploy/tlon/Dockerfile` build. A published deployment can instead pin the release's `ghcr.io/yc-software/qm/tlon@sha256:<digest>` image.
+
+After the operator installs the plugin once, each signed-in user connects their own bot ship under **Web UI → Keychain → Tlon** with its URL, login code, and their owner ship. Login codes are encrypted in that tenant's Postgres database and never displayed again. One `qm-<tenant>-tlon` sidecar connects outward to every user-owned account in that tenant; neither the host operator nor the configured ships need another sidecar.
+
 The host loads that image into a dedicated nested Docker daemon for each tenant. Tenant cores never receive the host Docker socket or another tenant's daemon endpoint. The daemon requires mutual TLS, and only that tenant's core receives the client certificate; agent containers can reach the daemon network address but cannot authenticate to its API. Agent execution endpoints require unique per-container bearer credentials derived from a tenant-scoped secret. Sandbox daemon state, certificates, and the credential root are retained in tenant-scoped durable state.
 
 The gateway image must be pinned by manifest digest. Resolve the chosen official Caddy image before recording it:

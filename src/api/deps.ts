@@ -52,6 +52,7 @@ import type { UiStateStore } from "../surfaces/ui-state.ts";
 import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
+import type { TlonInstallationStore } from "../surfaces/tlon-installation.ts";
 
 export interface ServerDeps {
   production?: boolean;
@@ -64,6 +65,7 @@ export interface ServerDeps {
   replayDedupe?: ReplayDedupe;
   connectorTokens?: ConnectorTokenStore;
   slackInstallation?: SlackInstallationStore;
+  tlonInstallations?: TlonInstallationStore;
   slackInstallationFetch?: typeof fetch;
   slackInstallationSocketAppId?: SlackSocketAppIdReader;
   slackEnvironmentState?: "absent" | "configured" | "partial";

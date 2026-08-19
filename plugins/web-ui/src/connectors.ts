@@ -16,6 +16,27 @@ interface ConnectorProvider {
   hosts?: Array<{ host?: string } | string>;
 }
 
+interface TlonConnection {
+  id: string;
+  ship: string;
+  url: string;
+  ownerShip: string;
+  channels: string[];
+  respondWithoutMention: boolean;
+  runtimeStatus: "pending" | "connecting" | "connected" | "error" | "stopped";
+  runtimeMessage?: string;
+}
+
+interface TlonDraft {
+  id?: string;
+  ship: string;
+  url: string;
+  code: string;
+  ownerShip: string;
+  channels: string;
+  respondWithoutMention: boolean;
+}
+
 const CONNECTOR_LABELS: Record<string, { name: string; hosts: string; desc?: string }> = {
   google: {
     name: "Google Workspace",
@@ -128,6 +149,9 @@ interface KeychainUsage {
 }
 
 let connectorProviders: Record<string, ConnectorProvider> = {};
+let tlonConnections: TlonConnection[] = [];
+let tlonDraft: TlonDraft | null = null;
+let tlonBusy = false;
 let keychainCredentials: KeychainCredential[] = [];
 let keychainConnectorCredentials: KeychainConnectorCredential[] = [];
 let keychainGrants: KeychainGrant[] = [];
@@ -144,6 +168,9 @@ const keychainOperations = new KeychainOperations();
 export function resetKeychainState(): void {
   keychainOperations.reset();
   connectorProviders = {};
+  tlonConnections = [];
+  tlonDraft = null;
+  tlonBusy = false;
   keychainCredentials = [];
   keychainConnectorCredentials = [];
   keychainGrants = [];
@@ -422,6 +449,228 @@ export function noteConnectorResult(provider: string, status: string): void {
   connectorNotice = status === "connected" ? `${name}: connected.` : `${name}: connection failed.`;
 }
 
+function editTlon(connection?: TlonConnection): void {
+  tlonDraft = connection
+    ? {
+        id: connection.id,
+        ship: connection.ship,
+        url: connection.url,
+        code: "",
+        ownerShip: connection.ownerShip,
+        channels: connection.channels.join("\n"),
+        respondWithoutMention: connection.respondWithoutMention,
+      }
+    : { ship: "", url: "", code: "", ownerShip: "", channels: "", respondWithoutMention: false };
+  connectorNotice = "";
+  drawConnectors();
+}
+
+function tlonStatus(connection: TlonConnection): TemplateResult {
+  if (connection.runtimeStatus === "connected") return html`<span class="kc-state">Online</span>`;
+  if (connection.runtimeStatus === "error") return html`<span class="kc-state warning">Connection error</span>`;
+  if (connection.runtimeStatus === "connecting") return html`<span class="kc-state neutral">Connecting…</span>`;
+  if (connection.runtimeStatus === "stopped") return html`<span class="kc-state warning">Sidecar offline</span>`;
+  return html`<span class="kc-state neutral">Pending</span>`;
+}
+
+function tlonForm(): TemplateResult {
+  const draft = tlonDraft!;
+  let submitLabel = "Connect ship";
+  if (tlonBusy) submitLabel = "Connecting…";
+  else if (draft.id) submitLabel = "Save connection";
+  return html`<section class="kc-add-card" aria-labelledby="tlon-connect-title">
+    <div class="kc-panel-head">
+      <div>
+        <span class="kc-eyebrow">${draft.id ? "Update account" : "New account"}</span>
+        <h2 id="tlon-connect-title">Connect a Tlon ship</h2>
+        <p>The tenant's shared connector logs into this bot ship. Only your owner ship can invoke your QM account.</p>
+      </div>
+      <div class="kc-panel-icon">${connectorLogo("tlon")}</div>
+    </div>
+    <div class="kc-form-grid">
+      <label class="skill-field"
+        ><span>Bot ship</span
+        ><input
+          class="skill-desc-input"
+          placeholder="~sampel-palnet"
+          autocomplete="off"
+          ?disabled=${tlonBusy}
+          .value=${draft.ship}
+          @input=${(e: Event) => (draft.ship = (e.target as HTMLInputElement).value)}
+      /></label>
+      <label class="skill-field"
+        ><span>Ship URL</span
+        ><input
+          class="skill-desc-input"
+          placeholder="https://ship.example.com"
+          inputmode="url"
+          autocomplete="url"
+          ?disabled=${tlonBusy}
+          .value=${draft.url}
+          @input=${(e: Event) => (draft.url = (e.target as HTMLInputElement).value)}
+      /></label>
+      <label class="skill-field"
+        ><span>Login code ${draft.id ? html`<em>leave blank to keep it</em>` : ""}</span
+        ><input
+          class="skill-desc-input"
+          type="password"
+          placeholder=${draft.id ? "Already stored" : "Required"}
+          autocomplete="new-password"
+          ?disabled=${tlonBusy}
+          .value=${draft.code}
+          @input=${(e: Event) => (draft.code = (e.target as HTMLInputElement).value)}
+      /></label>
+      <label class="skill-field"
+        ><span>Your owner ship</span
+        ><input
+          class="skill-desc-input"
+          placeholder="~wicdev-wisryt"
+          autocomplete="off"
+          ?disabled=${tlonBusy}
+          .value=${draft.ownerShip}
+          @input=${(e: Event) => (draft.ownerShip = (e.target as HTMLInputElement).value)}
+      /></label>
+      <label class="skill-field kc-purpose-field"
+        ><span>Channels <em>optional, one nest per line</em></span
+        ><textarea
+          class="skill-desc-input"
+          placeholder="chat/~host/channel"
+          ?disabled=${tlonBusy}
+          .value=${draft.channels}
+          @input=${(e: Event) => (draft.channels = (e.target as HTMLTextAreaElement).value)}
+        ></textarea>
+      </label>
+    </div>
+    <label class="kc-checkbox-row"
+      ><input
+        type="checkbox"
+        ?disabled=${tlonBusy}
+        .checked=${draft.respondWithoutMention}
+        @change=${(e: Event) => (draft.respondWithoutMention = (e.target as HTMLInputElement).checked)}
+      />Respond to your messages in configured channels without a bot mention</label
+    >
+    <div class="kc-form-actions">
+      <button
+        class="btn"
+        type="button"
+        ?disabled=${tlonBusy}
+        @click=${() => {
+          tlonDraft = null;
+          drawConnectors();
+        }}
+      >
+        Cancel</button
+      ><button class="btn primary" type="button" ?disabled=${tlonBusy} @click=${() => void saveTlon()}>
+        ${submitLabel}
+      </button>
+    </div>
+  </section>`;
+}
+
+function tlonCard(): TemplateResult {
+  return html`<article class="kc-resource kc-account">
+    <div class="kc-resource-main">
+      ${connectorLogo("tlon")}
+      <div class="kc-resource-copy">
+        <div class="kc-resource-title-row"><h3>Tlon</h3></div>
+        <div class="kc-resource-meta">Ships, DMs & channels</div>
+      </div>
+    </div>
+    <p class="kc-resource-description">
+      Connect a bot ship with its URL and login code. The tenant sidecar manages the connection for you.
+    </p>
+    ${tlonConnections.map(
+      (connection) =>
+        html`<div class="kc-access-block">
+          <div class="kc-access-row">
+            <div>
+              <strong>${connection.ship}</strong> ${tlonStatus(connection)}
+              <div>${connection.url} · owner ${connection.ownerShip}</div>
+              ${connection.runtimeMessage ? html`<div class="kc-inline-warning">${connection.runtimeMessage}</div>` : ""}
+            </div>
+            <div class="kc-resource-actions">
+              <button class="kc-text-action" type="button" ?disabled=${tlonBusy} @click=${() => editTlon(connection)}>
+                Edit</button
+              ><button
+                class="kc-text-action danger"
+                type="button"
+                data-confirm-key=${`disconnect-tlon:${connection.id}`}
+                ?disabled=${tlonBusy}
+                @click=${() => disconnectTlon(connection)}
+              >
+                Disconnect
+              </button>
+            </div>
+          </div>
+        </div>`,
+    )}
+    <div class="kc-resource-actions">
+      <button class="btn" type="button" ?disabled=${tlonBusy} @click=${() => editTlon()}>Connect ship</button>
+    </div>
+  </article>`;
+}
+
+async function saveTlon(): Promise<void> {
+  if (!tlonDraft || tlonBusy) return;
+  const draft = { ...tlonDraft };
+  if (!draft.ship.trim() || !draft.url.trim() || !draft.ownerShip.trim() || (!draft.id && !draft.code.trim())) {
+    connectorNotice = "Bot ship, ship URL, owner ship, and a login code for new connections are required.";
+    return drawConnectors();
+  }
+  tlonBusy = true;
+  connectorNotice = "";
+  drawConnectors();
+  try {
+    await api(draft.id ? `/api/tlon/connections/${encodeURIComponent(draft.id)}` : "/api/tlon/connections", {
+      method: draft.id ? "PUT" : "POST",
+      body: JSON.stringify({
+        ship: draft.ship.trim(),
+        url: draft.url.trim(),
+        code: draft.code.trim(),
+        ownerShip: draft.ownerShip.trim(),
+        channels: draft.channels
+          .split(/[\n,]/)
+          .map((value) => value.trim())
+          .filter(Boolean),
+        respondWithoutMention: draft.respondWithoutMention,
+      }),
+    });
+    tlonDraft = null;
+    connectorNotice = "Tlon connection saved. The tenant sidecar will connect within a few seconds.";
+  } catch (error) {
+    connectorNotice = errMessage(error, "Could not connect the Tlon ship.");
+  } finally {
+    tlonBusy = false;
+    await renderConnectors();
+  }
+}
+
+function disconnectTlon(connection: TlonConnection): void {
+  confirmationOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  confirmation = {
+    title: `Disconnect ${connection.ship}?`,
+    body: "QM will stop receiving and replying through this ship. The encrypted login code will be deleted.",
+    action: "Disconnect ship",
+    run: async () => {
+      confirmation = null;
+      confirmationOpener = null;
+      tlonBusy = true;
+      drawConnectors();
+      try {
+        await api(`/api/tlon/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" });
+        if (tlonDraft?.id === connection.id) tlonDraft = null;
+        connectorNotice = `${connection.ship} disconnected.`;
+      } catch (error) {
+        connectorNotice = errMessage(error, "Could not disconnect the Tlon ship.");
+      } finally {
+        tlonBusy = false;
+        await renderConnectors();
+      }
+    },
+  };
+  drawConnectors();
+}
+
 function drawConnectors(loading = false): void {
   if (appState.currentView !== "keychain") return;
   const entries = Object.entries(connectorProviders);
@@ -435,7 +684,7 @@ function drawConnectors(loading = false): void {
     keychainGrants,
     keychainAsks,
   );
-  const connectorCards = entries.map(([id, p]) => {
+  const connectorCards: TemplateResult[] = entries.map(([id, p]) => {
     const meta = CONNECTOR_LABELS[id] ?? { name: id, hosts: "" };
     const connected = Boolean(p.connected);
     const needsReconnect = Boolean(p.needsReconnect);
@@ -499,6 +748,9 @@ function drawConnectors(loading = false): void {
       </article>
     `;
   });
+  connectorCards.push(tlonCard());
+  const connectedAccounts =
+    summary.connected + tlonConnections.filter((connection) => connection.runtimeStatus === "connected").length;
   if (!appState.mainEl) return;
   const host = document.createElement("div");
   host.className = scopedSession.active ? "pane keychain-page scoped-view" : "pane keychain-page";
@@ -541,7 +793,7 @@ function drawConnectors(loading = false): void {
           </div>
         </header>
         <div class="kc-summary" aria-label="Keychain summary">
-          <div><span>${loading ? "—" : summary.connected}</span><small>Connected accounts</small></div>
+          <div><span>${loading ? "—" : connectedAccounts}</span><small>Connected accounts</small></div>
           <div><span>${loading ? "—" : keychainCredentials.length}</span><small>Stored credentials</small></div>
           <div><span>${loading ? "—" : summary.activeGrants}</span><small>Active grants</small></div>
           <div class=${summary.attention ? "needs-attention" : ""}>
@@ -549,12 +801,12 @@ function drawConnectors(loading = false): void {
           </div>
         </div>
         ${connectorNotice || loading ? html`<div class="kc-notice" role="status">${loading ? "Loading your keychain…" : connectorNotice}</div>` : ""}
-        ${addingCredential ? addCredentialCard() : ""}
+        ${tlonDraft ? tlonForm() : ""} ${addingCredential ? addCredentialCard() : ""}
         <section class="kc-section" aria-labelledby="kc-accounts-title">
           <div class="kc-section-head">
             <div class="kc-section-title">
               <h2 id="kc-accounts-title">Linked accounts</h2>
-              <span>${entries.length}</span>
+              <span>${entries.length + tlonConnections.length}</span>
             </div>
             <p>Provider APIs the agent can use as you.</p>
           </div>
@@ -618,7 +870,7 @@ export async function renderConnectors(): Promise<void> {
   const seq = appState.viewRenderSeq;
   const load = keychainOperations.beginLoad();
   drawConnectors(true);
-  const [conn, keys] = await Promise.allSettled([
+  const [conn, keys, tlon] = await Promise.allSettled([
     api<{ providers?: Record<string, ConnectorProvider> }>("/api/connectors"),
     api<{
       credentials?: KeychainCredential[];
@@ -628,6 +880,7 @@ export async function renderConnectors(): Promise<void> {
       usage?: KeychainUsage[];
       scopeNames?: Record<string, string>;
     }>("/api/keychain/overview"),
+    api<{ connections?: TlonConnection[] }>("/api/tlon/connections"),
   ]);
   if (seq !== appState.viewRenderSeq || !keychainOperations.isCurrentLoad(load) || appState.currentView !== "keychain")
     return;
@@ -655,6 +908,12 @@ export async function renderConnectors(): Promise<void> {
     keychainUsage = [];
     keychainScopeNames = {};
     notices.push(errMessage(keys.reason, "Failed to load stored keys."));
+  }
+  if (tlon.status === "fulfilled") {
+    tlonConnections = tlon.value.connections ?? [];
+  } else {
+    tlonConnections = [];
+    notices.push(errMessage(tlon.reason, "Failed to load Tlon connections."));
   }
   if (notices.length) connectorNotice = notices.join(" ");
   drawConnectors(false);

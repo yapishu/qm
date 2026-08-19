@@ -3845,6 +3845,18 @@ a.chat-row-open {
   letter-spacing: 0;
   text-transform: none;
 }
+.kc-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.kc-access-row .kc-resource-actions {
+  flex: 0 0 auto;
+  margin: 0;
+}
 .kc-form-actions {
   display: flex;
   align-items: center;

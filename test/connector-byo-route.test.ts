@@ -9,8 +9,14 @@ import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
 import { buildApp, type BuiltApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
+import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../plugins/chassis/src/portal-identity.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
+const PORTAL_SECRET = "tlon-user-connections-portal-secret";
+const userHeaders = (principalId: string) => ({
+  "content-type": "application/json",
+  [PORTAL_IDENTITY_HEADER]: mintPortalIdentity({ p: principalId, exp: Date.now() + 60_000 }, PORTAL_SECRET),
+});
 
 function start(socketAppId = "A-ACME"): { base: string; built: BuiltApp; close: () => Promise<void> } {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "byo-route-")) }));
@@ -19,6 +25,8 @@ function start(socketAppId = "A-ACME"): { base: string; built: BuiltApp; close: 
     replayDedupe: built.replayDedupe,
     connectorTokens: built.connectorTokens,
     slackInstallation: built.slackInstallation,
+    tlonInstallations: built.tlonInstallations,
+    portalIdentitySecret: PORTAL_SECRET,
     slackInstallationFetch: (async (input: string | URL | Request) => {
       const url = String(input);
       return new Response(
@@ -166,6 +174,112 @@ test("admin rejects Slack bot and Socket Mode tokens from different apps", async
     assert.equal(put.status, 400);
     assert.match(await put.text(), /different Slack apps/);
     assert.equal(await srv.built.slackInstallation.get(), null);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("signed-in users manage only their own encrypted Tlon connections", async () => {
+  const srv = start();
+  try {
+    const alice = userHeaders("alice@example.com");
+    const bob = userHeaders("bob@example.com");
+    const create = await fetch(`${srv.base}/v1/tlon/connections`, {
+      method: "POST",
+      headers: alice,
+      body: JSON.stringify({
+        ship: "~sampel-palnet",
+        url: "https://support.example.com",
+        code: "lidlut-tabwed-pillex-ridrup",
+        ownerShip: "~zod",
+        channels: ["chat/~sampel-palnet/general"],
+      }),
+    });
+    const createText = await create.text();
+    assert.equal(create.status, 201, createText);
+    const created = JSON.parse(createText) as { connection: { id: string } };
+    const id = created.connection.id;
+
+    const response = await fetch(`${srv.base}/v1/tlon/connections`, { headers: alice });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.doesNotMatch(text, /lidlut/);
+    assert.deepEqual(
+      (JSON.parse(text) as { connections: Array<{ id: string }> }).connections.map((record) => record.id),
+      [id],
+    );
+    assert.deepEqual(
+      ((await (await fetch(`${srv.base}/v1/tlon/connections`, { headers: bob })).json()) as { connections: unknown[] })
+        .connections,
+      [],
+    );
+    assert.equal((await fetch(`${srv.base}/v1/tlon/connections`)).status, 401);
+    assert.equal(
+      (
+        await fetch(`${srv.base}/v1/tlon/connections`, {
+          method: "POST",
+          headers: alice,
+          body: JSON.stringify({
+            ship: "~nec",
+            url: "http://127.0.0.1:8080",
+            code: "unsafe",
+            ownerShip: "~zod",
+          }),
+        })
+      ).status,
+      400,
+    );
+
+    const runtime = await srv.built.tlonInstallations.runtime();
+    assert.equal(runtime[0]?.code, "lidlut-tabwed-pillex-ridrup");
+    assert.equal(runtime[0]?.principalId, "alice@example.com");
+    const oldVersion = runtime[0]!.version;
+    const sourceResponse = await fetch(`${srv.base}/v1/tlon/installations`);
+    assert.equal(sourceResponse.status, 200);
+    const sourceRecords = (await sourceResponse.json()) as {
+      installations: Array<{ principalId: string; code: string }>;
+    };
+    assert.equal(sourceRecords.installations[0]?.principalId, "alice@example.com");
+    const statusReport = await fetch(`${srv.base}/v1/tlon/installations/${id}/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: oldVersion, status: "connected" }),
+    });
+    assert.equal(statusReport.status, 200, await statusReport.text());
+    assert.equal((await srv.built.tlonInstallations.list("alice@example.com"))[0]?.runtimeStatus, "connected");
+
+    const deniedEdit = await fetch(`${srv.base}/v1/tlon/connections/${id}`, {
+      method: "PUT",
+      headers: bob,
+      body: JSON.stringify({
+        ship: "~sampel-palnet",
+        url: "https://support.example.com",
+        code: "",
+        ownerShip: "~zod",
+      }),
+    });
+    assert.equal(deniedEdit.status, 404);
+    const edit = await fetch(`${srv.base}/v1/tlon/connections/${id}`, {
+      method: "PUT",
+      headers: alice,
+      body: JSON.stringify({
+        ship: "~sampel-palnet",
+        url: "https://new-support.example.com",
+        code: "",
+        ownerShip: "~zod",
+      }),
+    });
+    assert.equal(edit.status, 200, await edit.text());
+    assert.equal((await srv.built.tlonInstallations.runtime())[0]?.code, "lidlut-tabwed-pillex-ridrup");
+    assert.equal(await srv.built.tlonInstallations.report(id, { version: oldVersion, status: "connected" }), false);
+
+    assert.equal(
+      (await fetch(`${srv.base}/v1/tlon/connections/${id}`, { method: "DELETE", headers: bob })).status,
+      404,
+    );
+    const del = await fetch(`${srv.base}/v1/tlon/connections/${id}`, { method: "DELETE", headers: alice });
+    assert.equal(del.status, 200);
+    assert.deepEqual(await srv.built.tlonInstallations.list("alice@example.com"), []);
   } finally {
     await srv.close();
   }

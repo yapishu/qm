@@ -193,6 +193,16 @@ function resolvePluginImage(ctx: DockerCtx, p: ResolvedPlugin): string {
     dockerInherit(["build", "-f", p.dockerfile!, "-t", tag, p.sourceDir!]);
     return tag;
   }
+  if (ctx.buildFrom) {
+    const root = ctx.repoRoot!;
+    const dockerfile = join(root, "deploy", p.name, "Dockerfile");
+    if (existsSync(dockerfile)) {
+      const tag = `qm-${p.name}:local`;
+      step(`building plugin ${p.name} from ${dockerfile}`);
+      dockerInherit(["build", "-f", dockerfile, "-t", tag, root]);
+      return tag;
+    }
+  }
   if (useLocalDockerImage(p.image!, `plugin ${p.name}`)) return p.image!;
   step(`pulling plugin ${p.name} (${p.image})`);
   dockerInherit(["pull", p.image!], `failed to pull ${p.image} for plugin ${p.name}.`);
@@ -757,11 +767,12 @@ export async function dockerUp(
       }
     }
     for (const p of plugins) {
-      step(
-        p.kind === "image"
-          ? `plugin ${p.name}: pull ${p.image}`
-          : `plugin ${p.name}: build plugins/${p.name}/Dockerfile`,
-      );
+      const bundled = ctx.buildFrom && existsSync(join(ctx.repoRoot!, "deploy", p.name, "Dockerfile"));
+      let plan: string;
+      if (bundled) plan = `plugin ${p.name}: build deploy/${p.name}/Dockerfile`;
+      else if (p.kind === "image") plan = `plugin ${p.name}: pull ${p.image}`;
+      else plan = `plugin ${p.name}: build plugins/${p.name}/Dockerfile`;
+      step(plan);
     }
     note("\n" + bold("Plan only. Re-run without --dry-run to apply."));
     return;

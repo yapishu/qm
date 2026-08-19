@@ -27,6 +27,8 @@ jobs:
             dockerfile: deploy/portal/Dockerfile
           - name: auth
             dockerfile: deploy/auth/Dockerfile
+          - name: tlon
+            dockerfile: deploy/tlon/Dockerfile
           - name: sandbox-base
             dockerfile: fly/Dockerfile
             build-args: INSTALL_BROWSER_ENGINE=1
