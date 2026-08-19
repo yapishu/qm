@@ -154,6 +154,8 @@ test("stopping remains bounded when Airlock cleanup never settles", async () => 
 test("computing presence uses Tlon's protocol and clears the same conversation", async () => {
   const pokes: Array<{ app: string; mark: string; json: unknown }> = [];
   const client = {
+    nodeId: installation.ship,
+    on: () => client,
     poke: async (poke: { app: string; mark: string; json: unknown }) => {
       pokes.push(poke);
     },
@@ -179,6 +181,7 @@ test("computing presence uses Tlon's protocol and clears the same conversation",
   });
   assert.equal(active.set.timeout, "~m1.s30");
   assert.equal(active.set.display.text, "Running a command");
+  assert.equal((active.set.display as { icon?: unknown }).icon, null);
   assert.deepEqual(JSON.parse(active.set.display.blob), {
     protocol: "tlon.computing-status.v1",
     thinking: true,
@@ -202,6 +205,83 @@ test("computing presence uses Tlon's protocol and clears the same conversation",
       },
     },
   });
+});
+
+test("outbound Markdown is delivered as native Tlon rich text", async () => {
+  const pokes: Array<{ app: string; mark: string; json: unknown }> = [];
+  const client = {
+    nodeId: installation.ship,
+    on: () => client,
+    poke: async (poke: { app: string; mark: string; json: unknown }) => {
+      pokes.push(poke);
+    },
+  } as unknown as Urbit;
+  const connection = new TlonConnection(installation, async () => {});
+  (connection as unknown as { client: Urbit | null }).client = client;
+
+  await connection.deliver({
+    id: "delivery-markdown",
+    destination: {
+      type: "tlon",
+      target: encodeDeliveryTarget({ accountId: "support", kind: "dm", target: "~zod" }),
+    },
+    text: "# Result\n\n**bold** and `code`\n\n- first\n- second",
+    idempotencyKey: "run:markdown",
+    createdAt: 1,
+  });
+
+  const wire = JSON.stringify(pokes[0]!.json);
+  assert.match(wire, /"header":\{"tag":"h1","content":\["Result"\]\}/);
+  assert.match(wire, /"bold":\["bold"\]/);
+  assert.match(wire, /"inline-code":"code"/);
+  assert.match(wire, /"listing":\{"list":\{"type":"unordered"/);
+  assert.doesNotMatch(wire, /\*\*bold\*\*/);
+});
+
+test("a blocked ship cannot stall another account or add API listeners", async () => {
+  const blockedInstallation = { ...installation, id: "blocked", ship: "~nec" };
+  let blockedPokes = 0;
+  let healthyPokes = 0;
+  let listeners = 0;
+  const never = new Promise<never>(() => {});
+  const blockedClient = {
+    nodeId: blockedInstallation.ship,
+    on: () => {
+      listeners++;
+      return blockedClient;
+    },
+    poke: async () => {
+      blockedPokes++;
+      await never;
+    },
+  } as unknown as Urbit;
+  const healthyClient = {
+    nodeId: installation.ship,
+    on: () => {
+      listeners++;
+      return healthyClient;
+    },
+    poke: async () => {
+      healthyPokes++;
+    },
+  } as unknown as Urbit;
+  const blocked = new TlonConnection(blockedInstallation, async () => {});
+  const healthy = new TlonConnection(installation, async () => {});
+  (blocked as unknown as { client: Urbit | null }).client = blockedClient;
+  (healthy as unknown as { client: Urbit | null }).client = healthyClient;
+
+  void blocked.publishPresence("~zod", []).catch(() => undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  await Promise.race([
+    healthy.publishPresence("~zod", []),
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("healthy account remained blocked")), 100),
+    ),
+  ]);
+
+  assert.equal(blockedPokes, 1);
+  assert.equal(healthyPokes, 1);
+  assert.equal(listeners, 0);
 });
 
 test("controller mirrors active run tools and clears presence after delivery", async () => {

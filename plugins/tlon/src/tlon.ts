@@ -1,12 +1,14 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  conversationIdToPresenceContext,
-  configureClient,
+  clearConversationPresence,
   createComputingStatus,
   getTextContent,
   getComputingStatusText,
   sendPost,
   sendReply,
   serializeComputingStatus,
+  setClientResolver,
+  setConversationPresence,
   Urbit,
   type ChannelStatus,
   type Story,
@@ -16,10 +18,13 @@ import { parseChannelMessage, parseDmMessage, dmInvites } from "./messages.ts";
 import { createPinnedOriginFetch, type PinnedOriginFetch } from "./network.ts";
 import type { Delivery, Installation } from "./types.ts";
 import { decodeDeliveryTarget } from "./target.ts";
+import { markdownToStory } from "./story.ts";
 
-let apiTail = Promise.resolve();
+const apiClient = new AsyncLocalStorage<Urbit>();
 const PRESENCE_TIMEOUT = "~m1.s30";
 const PRESENCE_TOOLS = new Set(["exec", "read", "web_fetch"]);
+
+setClientResolver(() => apiClient.getStore() ?? null);
 
 async function withinCleanup(promise: Promise<unknown>, ms: number): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
@@ -85,23 +90,9 @@ function storyToText(content: unknown): string {
   return getTextContent(content as Story) ?? "";
 }
 
-function textToStory(text: string): Story {
-  return text.split(/\n{2,}/).map((paragraph) => ({ inline: [paragraph] }));
-}
-
 async function withApi<T>(installation: Installation, client: Urbit, action: () => Promise<T>): Promise<T> {
-  const previous = apiTail;
-  let release = (): void => {};
-  apiTail = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  await previous;
-  try {
-    await configureClient({ shipName: installation.ship.slice(1), shipUrl: installation.url, client });
-    return await action();
-  } finally {
-    release();
-  }
+  if (client.nodeId !== installation.ship) throw new Error("Tlon API client belongs to another ship");
+  return await apiClient.run(client, action);
 }
 
 function deliveryTime(delivery: Delivery): number {
@@ -248,7 +239,7 @@ export class TlonConnection {
     if (target.accountId !== this.installation.id) throw new Error("delivery belongs to another Tlon account");
     try {
       await withApi(this.installation, client, async () => {
-        const content = textToStory(delivery.text);
+        const content = markdownToStory(delivery.text);
         const sentAt = deliveryTime(delivery);
         if (target.replyTo) {
           await sendReply({
@@ -281,25 +272,18 @@ export class TlonConnection {
       (toolName) => ({ toolName }),
     );
     const status = createComputingStatus({ thinking: true, toolCalls });
-    await client.poke({
-      app: "presence",
-      mark: "presence-action-1",
-      json: {
-        set: {
-          disclose: [],
-          key: {
-            context: conversationIdToPresenceContext(conversationId),
-            ship: this.installation.ship,
-            topic: "computing",
-          },
-          timeout: PRESENCE_TIMEOUT,
-          display: {
-            text: getComputingStatusText(status),
-            blob: serializeComputingStatus({ thinking: true, toolCalls }),
-          },
+    await withApi(this.installation, client, () =>
+      setConversationPresence({
+        conversationId,
+        topic: "computing",
+        disclose: [],
+        timeout: PRESENCE_TIMEOUT,
+        display: {
+          text: getComputingStatusText(status),
+          blob: serializeComputingStatus({ thinking: true, toolCalls }),
         },
-      },
-    });
+      }),
+    );
     if (this.client === client && !this.stopped) this.presenceContexts.add(conversationId);
   }
 
@@ -307,17 +291,7 @@ export class TlonConnection {
     const client = this.client;
     this.presenceContexts.delete(conversationId);
     if (!client) return;
-    await client.poke({
-      app: "presence",
-      mark: "presence-action-1",
-      json: {
-        clear: {
-          context: conversationIdToPresenceContext(conversationId),
-          ship: this.installation.ship,
-          topic: "computing",
-        },
-      },
-    });
+    await withApi(this.installation, client, () => clearConversationPresence({ conversationId, topic: "computing" }));
   }
 
   async stop(): Promise<void> {
