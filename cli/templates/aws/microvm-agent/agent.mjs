@@ -2,10 +2,20 @@ import http from "node:http";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { timingSafeEqual } from "node:crypto";
 
 const PORT = Number(process.env.AGENT_PORT || 8080);
 const MAX_BUFFER = 256 * 1024 * 1024;
 const START_MS = Date.now();
+const AUTH_TOKEN = process.env.AGENT_AUTH_TOKEN || "";
+
+function authorized(req) {
+  if (!AUTH_TOKEN) return true;
+  const value = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+  const expected = Buffer.from(`Bearer ${AUTH_TOKEN}`);
+  const actual = Buffer.from(value);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 
 function readBody(req, cap = MAX_BUFFER) {
   return new Promise((resolve, reject) => {
@@ -74,6 +84,7 @@ async function handleRead(req, res) {
 const server = http.createServer((req, res) => {
   const route = (req.url || "").split("?")[0];
   (async () => {
+    if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
     if (route === "/health")
       return send(res, 200, {
         ok: true,

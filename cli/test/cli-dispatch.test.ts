@@ -53,6 +53,7 @@ test("help lists every deploy + develop command and the deploy-wide options", as
       "status",
       "logs",
       "down",
+      "host",
       "sandbox build",
       "infra build-image",
       "infra delete-task-definitions",

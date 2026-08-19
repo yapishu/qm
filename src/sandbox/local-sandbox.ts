@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { orgId as configOrgId } from "../config.ts";
 import { arch } from "node:os";
 import { join } from "node:path";
@@ -34,6 +34,7 @@ const AGENT_PORT = 8080;
 const RO_LAYERS_TAR = ".ro-layers.tar";
 const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const FINGERPRINT_LABEL = "qm.sandbox-fingerprint";
+const AUTH_LABEL = "qm.sandbox-auth";
 const BUILD_HINT = "run `npm run sandbox:local:build`";
 
 export type { DockerExec };
@@ -41,6 +42,9 @@ export type { DockerExec };
 export interface LocalSandboxOptions {
   image?: string;
   dockerBin?: string;
+  daemonHost?: string;
+  publishHost?: string;
+  authSecret?: string;
   cpus?: number;
   memoryMb?: number;
   defaultTimeoutSec?: number;
@@ -94,8 +98,18 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
   const fetchImpl = opts.fetchImpl ?? fetch;
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
   const homeDir = opts.homeDir ?? HOME_DIR;
+  const org = configOrgId();
+  const daemonHost = opts.daemonHost ?? "127.0.0.1";
+  const publishHost = opts.publishHost ?? "127.0.0.1";
   const workspaceDir = `${homeDir}/${WORKSPACE_BASENAME}`;
   const provisionQueue = createKeyedQueue<string>();
+
+  const authToken = (name: string): string | undefined =>
+    opts.authSecret ? createHmac("sha256", opts.authSecret).update(name).digest("hex") : undefined;
+  const authFingerprint = (name: string): string => {
+    const token = authToken(name);
+    return token ? createHash("sha256").update(token).digest("hex") : "";
+  };
 
   const portByName = new Map<string, number>();
   const scopeByContainer = new Map<string, string>();
@@ -136,11 +150,18 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     return preflightDone;
   }
 
-  async function containerState(name: string): Promise<{ running: boolean; imageId: string } | null> {
-    const r = await dexec(["inspect", "-f", "{{.State.Running}} {{.Image}}", name]);
+  async function containerState(
+    name: string,
+  ): Promise<{ running: boolean; imageId: string; authFingerprint: string } | null> {
+    const r = await dexec([
+      "inspect",
+      "-f",
+      `{{.State.Running}} {{.Image}} {{if .Config.Labels}}{{index .Config.Labels "${AUTH_LABEL}"}}{{end}}`,
+      name,
+    ]);
     if (r.code !== 0) return null;
-    const [running = "", imageId = ""] = r.stdout.trim().split(/\s+/);
-    return { running: running === "true", imageId };
+    const [running = "", imageId = "", auth = ""] = r.stdout.trim().split(/\s+/);
+    return { running: running === "true", imageId, authFingerprint: auth };
   }
 
   async function resolvePort(name: string): Promise<number> {
@@ -164,12 +185,18 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     body?: unknown,
     timeoutMs?: number,
     signal?: AbortSignal,
+    authenticate = true,
   ): Promise<{ status: number; text: string }> {
     const port = await resolvePort(name);
     const signals = [AbortSignal.timeout(timeoutMs ?? 30_000), ...(signal ? [signal] : [])];
-    const res = await fetchImpl(`http://127.0.0.1:${port}${path}`, {
+    const token = authToken(name);
+    const headers: Record<string, string> = {};
+    if (body !== undefined) headers["content-type"] = "application/json";
+    if (token && authenticate) headers.authorization = `Bearer ${token}`;
+    const res = await fetchImpl(`http://${daemonHost}:${port}${path}`, {
       method: body === undefined ? "GET" : "POST",
-      ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(Object.keys(headers).length ? { headers } : {}),
       signal: AbortSignal.any(signals),
     });
     return { status: res.status, text: await res.text() };
@@ -181,9 +208,21 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     while (Date.now() < deadline) {
       try {
         const res = await daemon(name, "/health", undefined, 3000);
-        if (res.status === 200) return;
-        lastErr = `http ${res.status}`;
+        if (res.status === 200) {
+          if (!authToken(name)) return;
+          const denied = await daemon(name, "/health", undefined, 3000, undefined, false);
+          if (denied.status === 401) return;
+          if (denied.status === 200) {
+            throw new Error(
+              `local sandbox image ${image} does not enforce agent authentication — rebuild and republish it`,
+            );
+          }
+          lastErr = `unauthenticated probe returned http ${denied.status}`;
+        } else {
+          lastErr = `http ${res.status}`;
+        }
       } catch (e) {
+        if (/does not enforce agent authentication/.test(errMessage(e))) throw e;
         lastErr = errMessage(e);
       }
       await sleep(300);
@@ -195,7 +234,17 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     portByName.delete(name);
     const r = await dexec(["start", name]);
     if (r.code !== 0) throw new Error(`docker start ${name} failed: ${r.stderr.trim()}`);
-    await waitDaemon(name);
+    await validateDaemon(name);
+  }
+
+  async function validateDaemon(name: string): Promise<void> {
+    try {
+      await waitDaemon(name);
+    } catch (error) {
+      await dexec(["rm", "-f", name]).catch(swallowAs("local-sandbox: rejected container rm", undefined));
+      portByName.delete(name);
+      throw error;
+    }
   }
 
   async function ensureRunning(name: string): Promise<void> {
@@ -238,6 +287,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
 
   async function runContainer(name: string, scope: string | undefined, withVolume: boolean): Promise<void> {
     const net = await ensureNetwork(name);
+    const token = authToken(name);
     const args = [
       "run",
       "-d",
@@ -247,14 +297,15 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       "qm.sandbox=1",
       ...(scope ? ["--label", `qm.scope=${scope}`] : []),
       "--label",
-      `qm.org=${configOrgId()}`,
+      `qm.org=${org}`,
       "--label",
       "agent_env=dev",
+      ...(token ? ["--label", `${AUTH_LABEL}=${authFingerprint(name)}`, "-e", `AGENT_AUTH_TOKEN=${token}`] : []),
       "--network",
       net,
       ...(withVolume && scope ? ["-v", `${localVolumeName(scope)}:${homeDir}`] : []),
       "-p",
-      `127.0.0.1:0:${AGENT_PORT}`,
+      `${publishHost}:0:${AGENT_PORT}`,
       "--add-host=host.docker.internal:host-gateway",
       ...(opts.cpus ? ["--cpus", String(opts.cpus)] : []),
       ...(opts.memoryMb ? ["--memory", `${opts.memoryMb}m`] : []),
@@ -263,7 +314,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     const r = await dexec(args, 120_000);
     if (r.code !== 0) throw new Error(`docker run ${name} failed: ${r.stderr.trim()}`);
     portByName.delete(name);
-    await waitDaemon(name);
+    await validateDaemon(name);
   }
 
   async function ensureContainer(scope: string): Promise<{ name: string; coldStart: boolean }> {
@@ -272,8 +323,9 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       const name = localContainerName(scope);
       scopeByContainer.set(name, scope);
       const state = await containerState(name);
-      if (state && state.imageId === imageId) {
+      if (state && state.imageId === imageId && state.authFingerprint === authFingerprint(name)) {
         if (!state.running) await startContainer(name);
+        else await validateDaemon(name);
         activeByContainer.set(name, (activeByContainer.get(name) ?? 0) + 1);
         return { name, coldStart: false };
       }
@@ -292,15 +344,17 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
 
   async function ensureScratch(key: string): Promise<{ name: string; coldStart: boolean }> {
     return provisionQueue(`scratch:${key}`, async () => {
-      await preflight();
+      const imageId = await preflight();
       const name = localScratchName(key);
       scratchByKey.set(key, name);
       const state = await containerState(name);
-      if (state) {
+      if (state && state.imageId === imageId && state.authFingerprint === authFingerprint(name)) {
         if (!state.running) await startContainer(name);
+        else await validateDaemon(name);
         activeByContainer.set(name, (activeByContainer.get(name) ?? 0) + 1);
         return { name, coldStart: false };
       }
+      if (state) await dexec(["rm", "-f", name]);
       await runContainer(name, undefined, false);
       activeByContainer.set(name, (activeByContainer.get(name) ?? 0) + 1);
       return { name, coldStart: true };
@@ -321,7 +375,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     processSessions: true,
     egressEnforcement: "none",
     spec: {
-      os: `Debian 12 (bookworm), glibc — local Docker container on a ${arch()} host (dev only)`,
+      os: `Debian 12 (bookworm), glibc — Docker container on a ${arch()} host`,
       runtimes: ["Node 24", "Python 3 (venv on PATH — `pip install` just works)"],
       tools: ["git", "curl", "wget", "jq", "unzip", "gnupg", "python3", "gh", "aws (CLI v2)"],
       notInstalled: ["gcloud", "kubectl", "flyctl", "glab"],

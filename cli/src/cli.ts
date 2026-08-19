@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { CliError, bold, dim, errMessage, note, ok, red } from "./log.ts";
+import { CliError, bold, dim, errMessage, header, note, ok, red } from "./log.ts";
 import {
   findConfigPath,
   isEmailTransport,
@@ -28,6 +28,16 @@ import { renderSlackFiles, runOutputs } from "./commands/outputs.ts";
 import { cliVersion } from "./manifest.ts";
 import { gitTopLevel, promptHidden, writeEnvValue } from "./util.ts";
 import { scopeStorageKey } from "./scope-storage-key.ts";
+import {
+  checkTenantHost,
+  downTenantHost,
+  loadHost,
+  renderTenantHost,
+  tenantHostStatus,
+  upTenantHost,
+} from "./host/manager.ts";
+import { HOST_CONFIG_FILENAME } from "./host/config.ts";
+import { serveTenantHostAdmin } from "./host/admin.ts";
 
 interface Parsed {
   positionals: string[];
@@ -150,6 +160,9 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
                                            build and validate the sandbox image locally
   sandbox publish [--from <img>] [--app <registry/repo>] [--tag <t>] [--dry-run]
                                            build, push, resolve digest, and record the immutable pin
+  host check|plan|up|render|status|down|serve [path]
+                                           operate several isolated Docker tenant deployments behind
+                                           one hostname gateway; serve starts the loopback admin API/UI
 
   ${dim("Options (apply to all deploy commands):")}
     --config <path>                        path to deploy config (default: qm.config.jsonc in deploy dir)
@@ -273,6 +286,60 @@ async function dispatch(argv: string[]): Promise<void> {
       rejectUnknownFlags(flags, []);
       rejectExtraPositionals(positionals, 1);
       await runSetup({ dir: positionals[0] !== undefined ? resolve(positionals[0]) : resolve(process.cwd()) });
+      return;
+    }
+
+    case "host": {
+      const sub = positionals[0];
+      if (!["check", "plan", "up", "render", "status", "down", "serve"].includes(sub ?? "")) {
+        throw new CliError(`usage: ${CLI_NAME} host check|plan|up|render|status|down|serve [path]`, {
+          clause: "cli.invocation",
+        });
+      }
+      rejectExtraPositionals(positionals, 2);
+      const common = ["config"];
+      if (sub === "up" || sub === "plan") rejectUnknownFlags(flags, [...common, "build-from"]);
+      else if (sub === "status") rejectUnknownFlags(flags, [...common, "json"]);
+      else if (sub === "serve") rejectUnknownFlags(flags, [...common, "listen"]);
+      else rejectUnknownFlags(flags, common);
+      const hostPath = strFlag(flags, "config") ?? positionals[1] ?? resolve(process.cwd(), HOST_CONFIG_FILENAME);
+      const host = loadHost(hostPath);
+      if (sub === "check") {
+        checkTenantHost(host);
+        ok(`tenant host check passed — ${host.id}`);
+        return;
+      }
+      if (sub === "render") {
+        checkTenantHost(host);
+        note(renderTenantHost(host));
+        return;
+      }
+      if (sub === "status") {
+        const status = tenantHostStatus(host);
+        if (boolFlag(flags, "json")) note(JSON.stringify(status, null, 2));
+        else {
+          header(`qm host status — ${host.id}`);
+          note(`gateway: ${status.gateway.running ? "running" : status.gateway.detail}`);
+          for (const tenant of status.tenants) {
+            note(`${tenant.orgId}: ${tenant.running ? "running" : "stopped"} · ${tenant.publicUrl}`);
+          }
+        }
+        return;
+      }
+      if (sub === "down") {
+        await downTenantHost(host);
+        return;
+      }
+      if (sub === "serve") {
+        if (process.env.QM_HOST_RECONCILE_ON_START === "1") await upTenantHost(host);
+        await serveTenantHostAdmin(host, { listen: strFlag(flags, "listen") });
+        return;
+      }
+      const buildFromFlag = flags["build-from"];
+      let buildFrom: string | undefined;
+      if (typeof buildFromFlag === "string") buildFrom = resolve(buildFromFlag);
+      else if (buildFromFlag === true) buildFrom = process.cwd();
+      await upTenantHost(host, { dryRun: sub === "plan", ...(buildFrom ? { buildFrom } : {}) });
       return;
     }
 

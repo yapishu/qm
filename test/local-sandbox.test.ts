@@ -118,6 +118,91 @@ test("cold provision creates volume + container, run() execs over the daemon, by
   assert.equal(await sb.readFileBytes(h, "bin/missing.dat"), null);
 });
 
+test("authenticated agent daemons reject missing and wrong credentials", async () => {
+  const port = await freePort();
+  const token = "agent-test-token";
+  const child = spawn(process.execPath, [join(process.cwd(), "aws/microvm-agent/agent.mjs")], {
+    env: { ...process.env, AGENT_PORT: String(port), AGENT_AUTH_TOKEN: token, HOME: guestHome },
+    stdio: "ignore",
+  });
+  try {
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`, {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        if (res.status === 200) break;
+      } catch {
+        if (Date.now() > deadline) throw new Error("authenticated test daemon never became reachable");
+      }
+      await sleep(100);
+    }
+    assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 401);
+    assert.equal(
+      (await fetch(`http://127.0.0.1:${port}/health`, { headers: { authorization: "Bearer wrong" } })).status,
+      401,
+    );
+    assert.equal(
+      (
+        await fetch(`http://127.0.0.1:${port}/exec`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cmd: "echo denied" }),
+        })
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await fetch(`http://127.0.0.1:${port}/exec`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ cmd: "printf allowed" }),
+        })
+      ).status,
+      200,
+    );
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
+test("tenant secret derives distinct credentials and replaces unauthenticated containers", async () => {
+  const fake = installFakeDocker(daemonPort);
+  const scopeA = scopeId("personal", "UA");
+  const scopeB = scopeId("personal", "UB");
+  const unauthenticated = await makeSandbox(fake).provision(rw(scopeA));
+  const enforcingFetch: typeof fetch = async (input, init) => {
+    if (!new Headers(init?.headers).has("authorization")) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+    }
+    return fetch(input, init);
+  };
+  const sandbox = makeSandbox(fake, { authSecret: "tenant-master-secret", fetchImpl: enforcingFetch });
+  const authenticatedA = await sandbox.provision(rw(scopeA));
+  const authenticatedB = await sandbox.provision(rw(scopeB));
+  const containerA = fake.containers.get(authenticatedA.id)!;
+  const containerB = fake.containers.get(authenticatedB.id)!;
+  assert.equal(authenticatedA.id, unauthenticated.id);
+  assert.equal(fake.runCount, 3);
+  assert.ok(containerA.env.AGENT_AUTH_TOKEN);
+  assert.ok(containerB.env.AGENT_AUTH_TOKEN);
+  assert.notEqual(containerA.env.AGENT_AUTH_TOKEN, containerB.env.AGENT_AUTH_TOKEN);
+  assert.notEqual(containerA.labels["qm.sandbox-auth"], containerA.env.AGENT_AUTH_TOKEN);
+  assert.notEqual(containerB.labels["qm.sandbox-auth"], containerB.env.AGENT_AUTH_TOKEN);
+});
+
+test("an agent image that ignores authentication fails closed", async () => {
+  const fake = installFakeDocker(daemonPort);
+  const sandbox = makeSandbox(fake, { authSecret: "tenant-master-secret" });
+  const layers = rw(scopeId("personal", "legacy-agent"));
+  await assert.rejects(sandbox.provision(layers), /does not enforce agent authentication/);
+  assert.equal(fake.containers.size, 0);
+  await assert.rejects(sandbox.provision(layers), /does not enforce agent authentication/);
+  assert.equal(fake.containers.size, 0);
+});
+
 test("teardown parks the container and the next provision restarts it warm", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);

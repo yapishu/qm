@@ -45,6 +45,7 @@ export interface DeployContext {
   sandboxDir: string;
   envFile?: string;
   target: Target;
+  isolateProcessEnv?: boolean;
 }
 
 type InfraOperation = "render" | "build-image" | "delete-image" | "delete-task-definitions";
@@ -137,17 +138,21 @@ const docker: HostingProvider = {
         buildFrom: opts.buildFrom ?? false,
         ...(opts.buildFromPath ? { buildFromPath: opts.buildFromPath } : {}),
         ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+        isolateProcessEnv: ctx.isolateProcessEnv,
         dryRun: opts.dryRun,
+        ...(!opts.dryRun
+          ? {
+              afterReconcile: () =>
+                syncDeploymentLayer({
+                  config: ctx.config,
+                  transport: hostingProvider(ctx.target).deploymentLayerTransport,
+                  configDir: ctx.configDir,
+                  sandboxDir: ctx.sandboxDir,
+                  ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+                }),
+            }
+          : {}),
       });
-      if (!opts.dryRun) {
-        await syncDeploymentLayer({
-          config: ctx.config,
-          transport: hostingProvider(ctx.target).deploymentLayerTransport,
-          configDir: ctx.configDir,
-          sandboxDir: ctx.sandboxDir,
-          ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
-        });
-      }
     },
     status: () => dockerStatus(ctx.config),
     logs: (service, opts) => dockerLogs(ctx.config, service, opts),
@@ -169,7 +174,14 @@ const docker: HostingProvider = {
   }),
   coordinates: () => ({}),
   requiresSandboxApp: true,
-  publishSandbox: (ctx, opts) => publishFlySandbox(ctx, opts, false),
+  publishSandbox: (ctx, opts) => {
+    if (ctx.config.sandbox?.backend === "local") {
+      throw new CliError(
+        `sandbox publish is not used with sandbox.backend "local"; build the agent image with npm run sandbox:local:build, push it to a registry, and set sandbox.image to its digest`,
+      );
+    }
+    return publishFlySandbox(ctx, opts, false);
+  },
   validateConfig: (config) => sandboxImagePinErrors(config),
 };
 

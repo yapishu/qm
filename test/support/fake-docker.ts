@@ -5,6 +5,7 @@ export interface FakeContainer {
   imageId: string;
   running: boolean;
   labels: Record<string, string>;
+  env: Record<string, string>;
   volume?: string;
 }
 
@@ -40,7 +41,7 @@ export function installFakeDocker(daemonPort: number): FakeDocker {
   const fail = (stderr: string) => ({ code: 1, stdout: "", stderr });
 
   function parseRun(args: string[]): FakeContainer {
-    const c: FakeContainer = { name: "", imageId: self.imageId, running: true, labels: {} };
+    const c: FakeContainer = { name: "", imageId: self.imageId, running: true, labels: {}, env: {} };
     for (let i = 0; i < args.length; i++) {
       const a = args[i]!;
       if (a === "--name") c.name = args[++i]!;
@@ -48,7 +49,10 @@ export function installFakeDocker(daemonPort: number): FakeDocker {
         const [k = "", v = ""] = args[++i]!.split("=");
         c.labels[k] = v;
       } else if (a === "-v") c.volume = args[++i]!.split(":")[0]!;
-      else if (a === "-p" || a === "--cpus" || a === "--memory") i++;
+      else if (a === "-e") {
+        const [k = "", ...parts] = args[++i]!.split("=");
+        c.env[k] = parts.join("=");
+      } else if (a === "-p" || a === "--cpus" || a === "--memory") i++;
     }
     return c;
   }
@@ -67,7 +71,7 @@ export function installFakeDocker(daemonPort: number): FakeDocker {
         const name = rest[rest.length - 1]!;
         const c = containers.get(name);
         if (!c) return fail(`Error: No such object: ${name}`);
-        return ok(`${c.running} ${c.imageId}`);
+        return ok(`${c.running} ${c.imageId} ${c.labels["qm.sandbox-auth"] ?? ""}`);
       }
       case "network": {
         const [sub, name] = rest as [string, string];

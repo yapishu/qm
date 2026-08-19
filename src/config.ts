@@ -247,6 +247,9 @@ function awsSandboxEnv(env: NodeJS.ProcessEnv): AwsSandboxEnv {
 interface LocalSandboxEnv {
   image?: string;
   dockerBin?: string;
+  daemonHost?: string;
+  publishHost?: string;
+  authSecret?: string;
   cpus?: number;
   memoryMb?: number;
   defaultTimeoutSec?: number;
@@ -256,6 +259,9 @@ function localSandboxEnv(env: NodeJS.ProcessEnv): LocalSandboxEnv {
   return {
     ...(env.LOCAL_SANDBOX_IMAGE ? { image: env.LOCAL_SANDBOX_IMAGE } : {}),
     ...(env.LOCAL_SANDBOX_DOCKER_BIN ? { dockerBin: env.LOCAL_SANDBOX_DOCKER_BIN } : {}),
+    ...(env.LOCAL_SANDBOX_DAEMON_HOST ? { daemonHost: env.LOCAL_SANDBOX_DAEMON_HOST } : {}),
+    ...(env.LOCAL_SANDBOX_PUBLISH_HOST ? { publishHost: env.LOCAL_SANDBOX_PUBLISH_HOST } : {}),
+    ...(env.LOCAL_SANDBOX_AUTH_SECRET ? { authSecret: env.LOCAL_SANDBOX_AUTH_SECRET } : {}),
     ...(numEnvStrict("LOCAL_SANDBOX_CPUS", env.LOCAL_SANDBOX_CPUS) !== undefined
       ? { cpus: numEnvStrict("LOCAL_SANDBOX_CPUS", env.LOCAL_SANDBOX_CPUS) }
       : {}),

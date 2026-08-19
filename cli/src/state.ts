@@ -18,7 +18,7 @@ const pause = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
-export function withDeploymentLock<T>(orgId: string, fn: () => T): T {
+export function acquireDeploymentLock(orgId: string): () => void {
   const dir = ensureDir(deploymentDir(orgId));
   const lock = join(dir, "up.lock");
   const deadline = Date.now() + 30_000;
@@ -47,10 +47,15 @@ export function withDeploymentLock<T>(orgId: string, fn: () => T): T {
       pause(50);
     }
   }
+  return () => rmSync(lock, { recursive: true, force: true });
+}
+
+export function withDeploymentLock<T>(orgId: string, fn: () => T): T {
+  const release = acquireDeploymentLock(orgId);
   try {
     return fn();
   } finally {
-    rmSync(lock, { recursive: true, force: true });
+    release();
   }
 }
 
@@ -58,6 +63,7 @@ export interface DeploymentState {
   orgId: string;
   network: string;
   pgPassword?: string;
+  sandboxAgentSecret?: string;
 }
 
 export function readDeploymentState(orgId: string): DeploymentState | undefined {

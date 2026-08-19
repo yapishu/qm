@@ -70,11 +70,13 @@ so it prints that snapshot as the matching data restore point
 (`aws rds restore-db-instance-from-db-snapshot`). Pre-deploy snapshots are
 pruned to a bounded count; `aws.predeployDbSnapshot: false` opts out.
 
-`sandbox build` is a local validation build. `sandbox publish` pushes through the
-configured OCI registry, resolves the image and base digests, records the base pin in
-the config and the image pin in the config (docker/fly) or the durable AWS deployment
-manifest, syncs the durable deployment layer when core is reachable, and repoints a
-running Fly or AWS core. On AWS it requires `sandbox.backend: "sprites"` and, before
+`sandbox build` is a local validation build. With Docker `sandbox.backend: "local"`,
+the operator pushes that image to a registry and records its digest as `sandbox.image`;
+`qm up` loads it into the deployment's tenant-local sandbox daemon. `sandbox publish`
+pushes through the configured Fly-compatible OCI registry, resolves the image and base
+digests, records the base pin in the config and the image pin in the config or durable
+AWS deployment manifest, syncs the durable deployment layer when core is reachable,
+and repoints a running Fly or AWS core. On AWS it requires `sandbox.backend: "sprites"` and, before
 building anything, an existing deployment manifest and no `sandbox.image` override —
 that override only seeds the first `qm up` and must be removed afterwards. Every
 ordinary `up` also syncs the layer.
@@ -104,10 +106,15 @@ down [--purge]
 rollback [--to revision-or-sha]
 sandbox build [--from image] [--tag tag] [--dry-run]
 sandbox publish [--from image] [--app registry/repo] [--tag tag] [--dry-run]
+host check|plan|up|render|status|down|serve [path]
 ```
 
 All deploy commands accept `--config`, `--env-file`, and `--sandbox-dir`. `dev` remains
 the contributor worktree loop and is separate from the portable deployment contract.
+
+`host` operates multiple isolated Docker deployment directories behind one Caddy gateway.
+Its loopback-only admin API and frontend expose tenant inventory, logs, lifecycle, and
+gateway reconciliation. See the [tenant-host runbook](https://github.com/yc-software/qm/tree/main/deploy/tenant-host).
 
 ## Package contract
 

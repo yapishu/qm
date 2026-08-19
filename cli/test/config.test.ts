@@ -840,6 +840,19 @@ test("sandbox.env (literals) + sandbox.secretEnv (resolved) become FLY_RESIDENT_
   );
 });
 
+test("docker local sandbox selects a self-hosted agent image without Fly settings", () => {
+  withConfig({ sandbox: { backend: "local", image: "qm-sandbox-local:latest" } }, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.deepEqual(config.sandbox, { backend: "local", image: "qm-sandbox-local:latest" });
+    assert.deepEqual(sandboxCoreEnv(config), {
+      env: { SANDBOX_BACKEND: "local", LOCAL_SANDBOX_IMAGE: "qm-sandbox-local:latest" },
+      missingSecrets: [],
+    });
+    assert.deepEqual(sandboxImagePinErrors(config), []);
+    assert.equal(sandboxPinPending(config), false);
+  });
+});
+
 test("no sandbox block → no injected env, lenient undefined app", () => {
   withConfig({}, ({ path }) => {
     const { config } = loadConfigAt(path);
@@ -858,8 +871,13 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
     { sandbox: { env: { "1BAD": "x" } }, rx: /"sandbox.env" key .* is not a valid env var name/ },
     { sandbox: { secretEnv: "X" }, rx: /"sandbox.secretEnv" must be an array of strings/ },
     { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
-    { sandbox: { backend: "k8s", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "aws"/ },
-    { sandbox: { backend: "fly", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "aws"/ },
+    { sandbox: { backend: "k8s", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "local".*or "aws"/ },
+    { sandbox: { backend: "fly", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "local".*or "aws"/ },
+    { sandbox: { backend: "local" }, rx: /"sandbox.backend": "local" requires "sandbox.image"/ },
+    {
+      sandbox: { backend: "local", image: "qm-sandbox-local:latest", app: "acme-sandboxes" },
+      rx: /"sandbox.backend": "local" ignores "sandbox.app"/,
+    },
     { sandbox: { backend: "sprites" }, rx: /"sandbox.backend": "sprites" requires "sandbox.app"/ },
     {
       sandbox: { backend: "aws", app: "acme-sandboxes" },

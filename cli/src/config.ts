@@ -45,7 +45,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "sprites" | "aws";
+  backend?: "local" | "sprites" | "aws";
   app?: string;
   image?: string;
   baseImage?: string;
@@ -206,10 +206,13 @@ export const isDigestPinned = (ref: string): boolean => /@sha256:[0-9a-f]{64}$/.
 const SANDBOX_PIN_PENDING = `"sandbox.app" is set but no sandbox layer image is pinned; run \`qm sandbox publish\` to build and record the digest-pinned "sandbox.image" agents boot from`;
 
 export const sandboxPinPending = (config: QmConfig): boolean =>
-  config.target !== "aws" && Boolean(config.sandbox?.app && !config.sandbox.image);
+  config.target !== "aws" &&
+  config.sandbox?.backend !== "local" &&
+  Boolean(config.sandbox?.app && !config.sandbox.image);
 
 export function sandboxImagePinErrors(config: QmConfig): Array<{ clause: string; message: string }> {
   const sb = config.sandbox;
+  if (sb?.backend === "local") return [];
   if (!sb?.app || !sb.image || isDigestPinned(sb.image)) return [];
   return [
     {
@@ -227,6 +230,11 @@ export function sandboxCoreEnv(
   const missingSecrets: string[] = [];
   const sb = config.sandbox;
   if (!sb) return { env, missingSecrets };
+  if (sb.backend === "local") {
+    env.SANDBOX_BACKEND = "local";
+    if (sb.image) env.LOCAL_SANDBOX_IMAGE = sb.image;
+    return { env, missingSecrets };
+  }
   if (sb.app) {
     if (!sb.image) throw new CliError(SANDBOX_PIN_PENDING, { clause: "config.v1" });
     const violation = sandboxImagePinErrors(config)[0];
@@ -281,7 +289,7 @@ function stripTrailingCommas(text: string): string {
   return out;
 }
 
-const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
+export const parseJsonc = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 
 const skipWs = (s: string, i: number): number => {
   while (i < s.length && /\s/.test(s[i]!)) i++;
@@ -414,7 +422,7 @@ export function loadConfigAt(path: string, overrides?: { target?: Target }): { c
   if (!existsSync(abs)) throw new CliError(`config file not found: ${path}`);
   let raw: unknown;
   try {
-    raw = parseConfigJson(readFileSync(abs, "utf8"));
+    raw = parseJsonc(readFileSync(abs, "utf8"));
   } catch (e) {
     throw new CliError(`${abs} is not valid JSON: ${errMessage(e)}`);
   }
@@ -478,7 +486,7 @@ function validateSecurityScreen(raw: unknown, path: string): SecurityScreenConfi
 
 export function readConfigOrgId(path: string): string | undefined {
   try {
-    const raw = parseConfigJson(readFileSync(path, "utf8"));
+    const raw = parseJsonc(readFileSync(path, "utf8"));
     const orgId = isPlainObject(raw) ? raw.orgId : undefined;
     return typeof orgId === "string" && validOrgId(orgId) ? orgId : undefined;
   } catch {
@@ -1326,9 +1334,9 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
   };
   const out: SandboxConfig = {};
   if (o["backend"] !== undefined) {
-    if (o["backend"] !== "sprites" && o["backend"] !== "aws") {
+    if (o["backend"] !== "local" && o["backend"] !== "sprites" && o["backend"] !== "aws") {
       throw new CliError(
-        `${path}: "sandbox.backend" must be "sprites" (Fly Sprites, booting the operator-published layer image from the Fly app in "sandbox.app") or "aws" (Lambda MicroVM sandboxes)`,
+        `${path}: "sandbox.backend" must be "local" (a Docker-hosted sandbox), "sprites" (Fly Sprites), or "aws" (Lambda MicroVM sandboxes)`,
       );
     }
     out.backend = o["backend"];
@@ -1378,7 +1386,16 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.image && !out.app) {
+  if (out.backend === "local") {
+    const stray = (["app", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
+    if (stray.length) {
+      throw new CliError(
+        `${path}: "sandbox.backend": "local" ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them`,
+      );
+    }
+    if (!out.image) throw new CliError(`${path}: "sandbox.backend": "local" requires "sandbox.image"`);
+  }
+  if (out.backend !== "local" && out.image && !out.app) {
     throw new CliError(`${path}: "sandbox.image" requires "sandbox.app" (the app the microVMs run in)`);
   }
   if (out.backend === "sprites" && !out.app) {

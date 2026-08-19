@@ -150,7 +150,12 @@ const existingDockerNames = (kind: "volume" | "network", candidates: string[]): 
   }
 };
 export const deploymentVolumes = (orgId: string): string[] =>
-  existingDockerNames("volume", [`qm-${orgId}-pgdata`, `qm-${orgId}-coredata`]);
+  existingDockerNames("volume", [
+    `qm-${orgId}-pgdata`,
+    `qm-${orgId}-coredata`,
+    `qm-${orgId}-sandbox-docker`,
+    `qm-${orgId}-sandbox-docker-certs`,
+  ]);
 export const deploymentNetworks = (orgId: string): string[] => existingDockerNames("network", [`qm-${orgId}`]);
 
 export function preexistingServiceImages(services: readonly string[]): string[] {
