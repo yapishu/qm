@@ -74,6 +74,8 @@ The gateway image must be pinned by manifest digest. Resolve the chosen official
 docker buildx imagetools inspect caddy:2-alpine
 ```
 
+Use either the top-level OCI index digest or the child manifest whose platform matches the host. Do not use an `unknown/unknown` child: those entries are attestations rather than runnable images. For an AMD64 host, select the `linux/amd64` child shown by the command.
+
 Validate and preview the entire host without changing Docker:
 
 ```bash
