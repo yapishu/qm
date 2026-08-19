@@ -3,7 +3,7 @@ import test from "node:test";
 import { dmInvites, parseChannelMessage, parseDmMessage } from "../src/messages.ts";
 import { decodeDeliveryTarget, encodeDeliveryTarget } from "../src/target.ts";
 import type { Installation } from "../src/types.ts";
-import { originLockedFetch } from "../src/tlon.ts";
+import { authenticateShip, originLockedFetch } from "../src/tlon.ts";
 
 const installation: Installation = {
   id: "support",
@@ -124,4 +124,50 @@ test("ship requests cannot leave their configured HTTPS origin or follow redirec
     (async () => new Response(null, { status: 302, headers: { location: "http://169.254.169.254" } })) as typeof fetch,
   );
   await assert.rejects(() => redirecting("https://ship.example.com/~/login"), /redirects are not allowed/);
+});
+
+test("ship authentication exchanges the login code for an origin-bound urbauth cookie", async () => {
+  const calls: Array<{ url: string; method: string; contentType: string | null; body: string; cookie: string | null }> =
+    [];
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const headers = new Headers(init?.headers);
+    calls.push({
+      url,
+      method: init?.method ?? "GET",
+      contentType: headers.get("content-type"),
+      body: String(init?.body ?? ""),
+      cookie: headers.get("cookie"),
+    });
+    if (url.endsWith("/~/login")) {
+      return new Response(null, {
+        status: 204,
+        headers: { "set-cookie": "urbauth-~sampel-palnet=session-secret; Path=/; HttpOnly" },
+      });
+    }
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  const authenticatedFetch = await authenticateShip(
+    installation.url,
+    installation.ship,
+    "code with + and spaces",
+    fetchImpl,
+  );
+  await authenticatedFetch(`${installation.url}/~/channel/1`, { method: "PUT", body: "[]" });
+  assert.deepEqual(calls, [
+    {
+      url: "https://ship.example.com/~/login",
+      method: "POST",
+      contentType: "application/x-www-form-urlencoded;charset=UTF-8",
+      body: "password=code+with+%2B+and+spaces",
+      cookie: null,
+    },
+    {
+      url: "https://ship.example.com/~/channel/1",
+      method: "PUT",
+      contentType: null,
+      body: "[]",
+      cookie: "urbauth-~sampel-palnet=session-secret",
+    },
+  ]);
 });

@@ -24,6 +24,41 @@ export function originLockedFetch(baseUrl: string, fetchImpl: typeof fetch = fet
   }) as typeof fetch;
 }
 
+function requestHeaders(input: string | URL | Request, init?: RequestInit): Headers {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+  return headers;
+}
+
+export async function authenticateShip(
+  baseUrl: string,
+  ship: string,
+  code: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<typeof fetch> {
+  const origin = new URL(baseUrl).origin;
+  const lockedFetch = originLockedFetch(origin, fetchImpl);
+  const response = await lockedFetch(`${origin}/~/login`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    body: new URLSearchParams({ password: code }).toString(),
+    signal: AbortSignal.timeout(30_000),
+  });
+  await response.text();
+  if (!response.ok) throw new Error(`Tlon login failed with HTTP ${response.status}`);
+  const expected = `urbauth-${ship}=`;
+  const cookie = response.headers
+    .getSetCookie()
+    .map((value) => value.split(";", 1)[0]?.trim() ?? "")
+    .find((value) => value.startsWith(expected));
+  if (!cookie) throw new Error(`Tlon login did not return the ${expected.slice(0, -1)} cookie`);
+  return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const headers = requestHeaders(input, init);
+    if (!headers.has("cookie")) headers.set("cookie", cookie);
+    return lockedFetch(input, { ...init, headers });
+  }) as typeof fetch;
+}
+
 function storyToText(content: unknown): string {
   return getTextContent(content as Story) ?? "";
 }
@@ -94,14 +129,13 @@ export class TlonConnection {
   }
 
   async start(): Promise<void> {
-    const client = new Urbit(
+    const authenticatedFetch = await authenticateShip(
       this.installation.url,
+      this.installation.ship,
       this.installation.code,
-      undefined,
-      originLockedFetch(this.installation.url),
     );
+    const client = new Urbit(this.installation.url, undefined, undefined, authenticatedFetch);
     client.nodeId = this.installation.ship;
-    await client.connect();
     await client.poke({ app: "hood", mark: "helm-hi", json: "opening airlock" });
     await client.eventSource();
     if (this.stopped) {

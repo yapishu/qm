@@ -1,4 +1,5 @@
 import { decodeDeliveryTarget } from "./target.ts";
+import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { CoreClient } from "./core.ts";
 import { TlonConnection } from "./tlon.ts";
 
@@ -57,27 +58,34 @@ export class TlonController {
       const next = desired.get(id);
       if (next?.version === connection.installation.version) {
         const runtime = connection.runtimeStatus();
-        await this.core.report(id, next.version, runtime.status, runtime.message).catch(() => undefined);
+        await this.core
+          .report(id, next.version, runtime.status, runtime.message)
+          .catch((error) => swallow(`report Tlon connection ${id}`, error));
         if (runtime.status !== "error") continue;
       }
       this.connections.delete(id);
-      await connection.stop().catch(() => undefined);
-      await this.core.report(id, connection.installation.version, "stopped").catch(() => undefined);
+      await connection.stop().catch((error) => swallow(`stop Tlon connection ${id}`, error));
+      await this.core
+        .report(id, connection.installation.version, "stopped")
+        .catch((error) => swallow(`report stopped Tlon connection ${id}`, error));
     }
     await Promise.all(
       installations
         .filter((installation) => !this.connections.has(installation.id))
         .map(async (installation) => {
-          await this.core.report(installation.id, installation.version, "connecting").catch(() => undefined);
+          await this.core.report(installation.id, installation.version, "connecting");
           const connection = new TlonConnection(installation, (message) => this.core.turn(message));
           try {
             await within(connection.start(), 30_000);
             this.connections.set(installation.id, connection);
             await this.core.report(installation.id, installation.version, "connected");
           } catch (error) {
-            await connection.stop().catch(() => undefined);
-            const message = error instanceof Error ? error.message : String(error);
-            await this.core.report(installation.id, installation.version, "error", message).catch(() => undefined);
+            await connection
+              .stop()
+              .catch((stopError) => swallow(`stop failed Tlon connection ${installation.id}`, stopError));
+            const message = errMessage(error);
+            console.error(`[tlon] connection ${installation.id} failed: ${message}`);
+            await this.core.report(installation.id, installation.version, "error", message);
           }
         }),
     );
@@ -124,7 +132,11 @@ export class TlonController {
   async stop(): Promise<void> {
     this.abort.abort();
     await Promise.all([this.reconcileTask, this.deliveryTask]);
-    await Promise.all([...this.connections.values()].map((connection) => connection.stop().catch(() => undefined)));
+    await Promise.all(
+      [...this.connections.values()].map((connection) =>
+        connection.stop().catch((error) => swallow(`stop Tlon connection ${connection.installation.id}`, error)),
+      ),
+    );
     this.connections.clear();
   }
 }
