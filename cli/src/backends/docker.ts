@@ -153,6 +153,17 @@ function imageRef(ctx: DockerCtx, service: ServiceName): string {
   return ctx.config.imageOverrides[service] ?? manifestRef(service);
 }
 
+function useLocalDockerImage(ref: string, label: string): boolean {
+  if (!isDockerImageId(ref)) return false;
+  step(`using local ${label} image ${ref}`);
+  if (!inspectExists(["image", "inspect", "-f", "{{.Id}}", ref], /No such image|No such object/i)) {
+    throw new CliError(
+      `local ${label} image ${ref} is not in the host Docker image store; build it on this host or re-run with --build-from`,
+    );
+  }
+  return true;
+}
+
 function resolveImage(ctx: DockerCtx, service: ServiceName): string {
   if (ctx.buildFrom) {
     const root = ctx.repoRoot!;
@@ -165,6 +176,7 @@ function resolveImage(ctx: DockerCtx, service: ServiceName): string {
     return tag;
   }
   const ref = imageRef(ctx, service);
+  if (useLocalDockerImage(ref, service)) return ref;
   step(`pulling ${ref}`);
   dockerInherit(
     ["pull", ref],
@@ -181,6 +193,7 @@ function resolvePluginImage(ctx: DockerCtx, p: ResolvedPlugin): string {
     dockerInherit(["build", "-f", p.dockerfile!, "-t", tag, p.sourceDir!]);
     return tag;
   }
+  if (useLocalDockerImage(p.image!, `plugin ${p.name}`)) return p.image!;
   step(`pulling plugin ${p.name} (${p.image})`);
   dockerInherit(["pull", p.image!], `failed to pull ${p.image} for plugin ${p.name}.`);
   return p.image!;

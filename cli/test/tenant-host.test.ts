@@ -85,7 +85,7 @@ test("tenant host rejects overlapping service ports and mutable gateway images",
   }
 });
 
-test("tenant host accepts local sandbox image IDs and rejects mutable sandbox tags", () => {
+test("tenant host accepts immutable local images and rejects mutable image tags", () => {
   const fixture = hostFixture();
   try {
     const configPath = join(fixture.dir, "tenants", "acme", "qm.config.jsonc");
@@ -96,6 +96,14 @@ test("tenant host accepts local sandbox image IDs and rejects mutable sandbox ta
     raw.sandbox.image = "qm-sandbox-local:latest";
     writeFileSync(configPath, JSON.stringify(raw));
     assert.throws(() => loadTenantHostConfig(fixture.path), /registry digest.*local Docker image ID/);
+    raw.sandbox.image = DIGEST;
+    const withOverrides = raw as typeof raw & { imageOverrides: { core: string } };
+    withOverrides.imageOverrides = { core: DIGEST };
+    writeFileSync(configPath, JSON.stringify(withOverrides));
+    assert.equal(loadTenantHostConfig(fixture.path).tenants[0]?.config.imageOverrides.core, DIGEST);
+    withOverrides.imageOverrides.core = "qm-core:latest";
+    writeFileSync(configPath, JSON.stringify(withOverrides));
+    assert.throws(() => loadTenantHostConfig(fixture.path), /imageOverrides\.core.*registry digest/);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }

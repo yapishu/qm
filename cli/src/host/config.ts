@@ -64,6 +64,13 @@ function tenantOf(raw: unknown, index: number, hostDir: string): TenantHostTenan
       `${configPath}: tenant host sandbox.image must be a registry digest ending in @sha256:<digest> or a local Docker image ID sha256:<digest>`,
     );
   }
+  for (const [service, image] of Object.entries(loaded.config.imageOverrides)) {
+    if (!isDigestPinned(image) && !isDockerImageId(image)) {
+      throw new CliError(
+        `${configPath}: tenant host imageOverrides.${service} must be a registry digest ending in @sha256:<digest> or a local Docker image ID sha256:<digest>`,
+      );
+    }
+  }
   const publicUrl = new URL(loaded.config.publicUrl);
   if (publicUrl.protocol !== "https:" || publicUrl.port || publicUrl.pathname !== "/") {
     throw new CliError(`${configPath}: tenant host publicUrl must be an HTTPS origin on the default port`);

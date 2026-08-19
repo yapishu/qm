@@ -90,6 +90,31 @@ test(
         assert.equal(got, sentinel);
       });
 
+      await t.test("immutable local image IDs start services without a registry pull", () => {
+        const imageOverrides = Object.fromEntries(
+          SERVICES.map((service) => [
+            service,
+            execFileSync("docker", ["image", "inspect", "-f", "{{.Id}}", `qm-${service}:local`], {
+              encoding: "utf8",
+            }).trim(),
+          ]),
+        );
+        writeConfig(dep, {
+          orgId: org,
+          target: "docker",
+          basePort,
+          services: [...SERVICES],
+          botName: "straylight",
+          orgName: "Straylight Industries",
+          imageOverrides,
+          env: { core: { HARNESS: "mock" } },
+        });
+        const r = runCli(["up"], { cwd: dep, env: { CORE_SIGNING_SECRET: undefined } });
+        assert.equal(r.code, 0, r.out);
+        assert.match(r.out, /using local core image sha256:/);
+        assert.doesNotMatch(r.out, /pulling sha256:/);
+      });
+
       await t.test("the configured bot identity reaches the core container and only the core container", () => {
         const names = deploymentContainers(org);
         const printenv = (container: string, name: string): string =>
