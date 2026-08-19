@@ -1,8 +1,12 @@
 import {
+  conversationIdToPresenceContext,
   configureClient,
+  createComputingStatus,
   getTextContent,
+  getComputingStatusText,
   sendPost,
   sendReply,
+  serializeComputingStatus,
   Urbit,
   type ChannelStatus,
   type Story,
@@ -14,6 +18,8 @@ import type { Delivery, Installation } from "./types.ts";
 import { decodeDeliveryTarget } from "./target.ts";
 
 let apiTail = Promise.resolve();
+const PRESENCE_TIMEOUT = "~m1.s30";
+const PRESENCE_TOOLS = new Set(["exec", "read", "web_fetch"]);
 
 async function withinCleanup(promise: Promise<unknown>, ms: number): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
@@ -115,6 +121,7 @@ export class TlonConnection {
   private readonly createTransport: (baseUrl: string) => Promise<PinnedOriginFetch>;
   private readonly createClient: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
   private readonly cleanupTimeoutMs: number;
+  private readonly presenceContexts = new Set<string>();
 
   constructor(
     installation: Installation,
@@ -267,10 +274,65 @@ export class TlonConnection {
     }
   }
 
+  async publishPresence(conversationId: string, toolNames: string[]): Promise<void> {
+    const client = this.client;
+    if (!client || this.stopped) throw new Error(`Tlon account ${this.installation.id} is not connected`);
+    const toolCalls = [...new Set(toolNames.map((toolName) => (PRESENCE_TOOLS.has(toolName) ? toolName : "tool")))].map(
+      (toolName) => ({ toolName }),
+    );
+    const status = createComputingStatus({ thinking: true, toolCalls });
+    await client.poke({
+      app: "presence",
+      mark: "presence-action-1",
+      json: {
+        set: {
+          disclose: [],
+          key: {
+            context: conversationIdToPresenceContext(conversationId),
+            ship: this.installation.ship,
+            topic: "computing",
+          },
+          timeout: PRESENCE_TIMEOUT,
+          display: {
+            text: getComputingStatusText(status),
+            blob: serializeComputingStatus({ thinking: true, toolCalls }),
+          },
+        },
+      },
+    });
+    if (this.client === client && !this.stopped) this.presenceContexts.add(conversationId);
+  }
+
+  async clearPresence(conversationId: string): Promise<void> {
+    const client = this.client;
+    this.presenceContexts.delete(conversationId);
+    if (!client) return;
+    await client.poke({
+      app: "presence",
+      mark: "presence-action-1",
+      json: {
+        clear: {
+          context: conversationIdToPresenceContext(conversationId),
+          ship: this.installation.ship,
+          topic: "computing",
+        },
+      },
+    });
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     const client = this.client;
     const transport = this.transport;
+    const contexts = [...this.presenceContexts];
+    this.presenceContexts.clear();
+    await Promise.all(
+      contexts.map((conversationId) =>
+        withinCleanup(this.clearPresence(conversationId), this.cleanupTimeoutMs).catch((error) =>
+          swallow(`clear Tlon presence ${this.installation.id}/${conversationId}`, error),
+        ),
+      ),
+    );
     await this.release(client, transport);
   }
 

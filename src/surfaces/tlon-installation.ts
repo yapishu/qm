@@ -52,6 +52,7 @@ export interface TlonConnectionInput {
 export interface TlonInstallationStore {
   list(principalId: string): Promise<TlonConnectionStatus[]>;
   runtime(): Promise<TlonRuntimeConnection[]>;
+  runtimeIds(): Promise<string[]>;
   create(principalId: string, input: TlonConnectionInput): Promise<TlonConnectionStatus>;
   update(principalId: string, id: string, input: TlonConnectionInput): Promise<TlonConnectionStatus | null>;
   delete(principalId: string, id: string): Promise<boolean>;
@@ -152,6 +153,9 @@ export function createTlonInstallationStore(
         principalId: record.principalId,
         code: decryptSecret(record.codeEnc, key),
       }));
+    },
+    async runtimeIds() {
+      return (await records()).map((record) => record.id);
     },
     async create(principalId, input) {
       const owner = personKey(principalId);

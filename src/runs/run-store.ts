@@ -78,6 +78,8 @@ export interface RunStore {
 
   activeSessionIds(): Promise<string[]>;
 
+  listActive(): Promise<Run[]>;
+
   list(opts?: { limit?: number }): Promise<Run[]>;
 
   reapExpired(

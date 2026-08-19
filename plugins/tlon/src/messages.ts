@@ -71,11 +71,11 @@ export function parseChannelMessage(
   if (text === null || !text) return null;
   const messageId = String(reply?.id ?? post?.id ?? "");
   if (!messageId) return null;
-  const seal = record(replySet?.seal ?? postSet?.seal);
+  const seal = record(replySet?.seal);
   let parent = "";
   if (typeof seal?.["parent-id"] === "string") parent = seal["parent-id"];
   else if (typeof seal?.parent === "string") parent = seal.parent;
-  const root = parent || String(post?.id ?? messageId);
+  const threadRoot = replySet ? parent || String(post?.id ?? "") : "";
   return {
     accountId: installation.id,
     principalId: installation.principalId,
@@ -84,7 +84,7 @@ export function parseChannelMessage(
     text,
     kind: "channel",
     target: nest,
-    threadRoot: root,
+    ...(threadRoot ? { threadRoot } : {}),
   };
 }
 
@@ -108,9 +108,9 @@ export function parseDmMessage(installation: Installation, value: unknown, toTex
     return null;
   const text = toText(content.content).trim();
   if (!text) return null;
-  const parent = writ(event.id, partner);
   const messageId = reply ? String(reply.id ?? deltaAdd?.id ?? "") : String(event.id ?? "");
   if (!messageId) return null;
+  const parent = reply ? writ(event.id, partner) : null;
   return {
     accountId: installation.id,
     principalId: installation.principalId,
@@ -119,8 +119,7 @@ export function parseDmMessage(installation: Installation, value: unknown, toTex
     text,
     kind: "dm",
     target: partner,
-    threadRoot: parent.id || messageId,
-    parentAuthor: parent.author,
+    ...(parent?.id ? { threadRoot: parent.id, parentAuthor: parent.author } : {}),
   };
 }
 

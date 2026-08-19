@@ -287,6 +287,13 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       return rows.map((r) => r.session_id as string);
     },
 
+    async listActive(): Promise<Run[]> {
+      const { rows } = await q(
+        "SELECT * FROM runs WHERE status IN ('pending','running') ORDER BY created_at ASC, seq ASC",
+      );
+      return rows.map(rowToRun);
+    },
+
     async list({ limit = 200 }: { limit?: number } = {}): Promise<Run[]> {
       const { rows } = await q("SELECT * FROM runs ORDER BY created_at DESC LIMIT $1", [limit]);
       return rows.map(rowToRun);

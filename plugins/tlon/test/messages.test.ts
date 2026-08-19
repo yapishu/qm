@@ -65,6 +65,30 @@ test("channel messages are principal-bound, owner-only, mention-gated, and threa
     ),
     null,
   );
+  assert.deepEqual(
+    parseChannelMessage(
+      installation,
+      {
+        nest: "chat/~zod/General",
+        response: {
+          post: {
+            id: "top-level-1",
+            "r-post": { set: { essay: { author: "~zod", content: "~sampel-palnet top level" } } },
+          },
+        },
+      },
+      text,
+    ),
+    {
+      accountId: "support",
+      principalId: "alice@example.com",
+      messageId: "top-level-1",
+      senderShip: "~zod",
+      text: "top level",
+      kind: "channel",
+      target: "chat/~zod/General",
+    },
+  );
 });
 
 test("DM messages route through the user's account and accept only its owner ship", () => {
@@ -85,9 +109,34 @@ test("DM messages route through the user's account and accept only its owner shi
     text: "hello",
     kind: "dm",
     target: "~zod",
-    threadRoot: "dm-root",
-    parentAuthor: "~zod",
   });
+  assert.deepEqual(
+    parseDmMessage(
+      installation,
+      {
+        whom: "~zod",
+        id: "~zod/dm-root",
+        response: {
+          reply: {
+            id: "dm-reply",
+            delta: { add: { "reply-essay": { author: "~zod", content: "inside thread" } } },
+          },
+        },
+      },
+      text,
+    ),
+    {
+      accountId: "support",
+      principalId: "alice@example.com",
+      messageId: "dm-reply",
+      senderShip: "~zod",
+      text: "inside thread",
+      kind: "dm",
+      target: "~zod",
+      threadRoot: "dm-root",
+      parentAuthor: "~zod",
+    },
+  );
   assert.deepEqual(dmInvites(installation, [{ ship: "~zod" }, { ship: "~bus" }, { ship: "nec" }]), ["~zod"]);
   assert.equal(
     parseDmMessage(

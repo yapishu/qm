@@ -119,6 +119,7 @@ for (const backend of backends) {
     await runs.enqueue({ sessionId: "sB", request: turn("b") });
     await runs.enqueue({ sessionId: "sB", request: turn("b2") });
     assert.deepEqual([...(await runs.activeSessionIds())].sort(), ["sA", "sB"], "pending counts, deduped per session");
+    assert.equal((await runs.listActive()).length, 3);
 
     const claimed = await runs.claim("w1", 5_000);
     assert.equal(claimed?.id, a.id);
@@ -126,6 +127,10 @@ for (const backend of backends) {
 
     await runs.complete(a.id, claimed?.leaseToken ?? "", { status: "ok", reply: "done" });
     assert.deepEqual(await runs.activeSessionIds(), ["sB"], "completed session drops out; sB still queued");
+    assert.deepEqual(
+      (await runs.listActive()).map((run) => run.sessionId),
+      ["sB", "sB"],
+    );
   });
 
   test(`[${backend.name}] claim is one-run-per-session and FIFO`, async () => {

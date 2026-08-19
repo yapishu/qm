@@ -10,6 +10,7 @@ import { createInsecureTestServer } from "../src/api/server.ts";
 import { buildApp, type BuiltApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../plugins/chassis/src/portal-identity.ts";
+import { encodeDeliveryTarget } from "../plugins/tlon/src/target.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 const PORTAL_SECRET = "tlon-user-connections-portal-secret";
@@ -49,6 +50,8 @@ function start(
     config: built.config,
     admin: built.admin,
     auditLog: built.auditLog,
+    runs: built.runs,
+    runActivity: built.runActivity,
     requireSignedPortalIdentity,
   });
   server.listen(0);
@@ -251,6 +254,62 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
     });
     assert.equal(statusReport.status, 200, await statusReport.text());
     assert.equal((await srv.built.tlonInstallations.list("alice@example.com"))[0]?.runtimeStatus, "connected");
+
+    const queued = await srv.built.app.turn({
+      surface: "tlon",
+      deliveryTarget: encodeDeliveryTarget({ accountId: id, kind: "dm", target: "~zod" }),
+      actor: { externalId: "alice@example.com", displayName: "~zod" },
+      conversation: { kind: "dm", threadRef: `tlon:${id}:dm:~zod`, isPrivate: true },
+      text: "check this",
+      idempotencyKey: "tlon:presence-test",
+      async: true,
+    });
+    assert.equal(queued.status, "queued");
+    await srv.built.runActivity.append(queued.runId!, {
+      seq: 1,
+      parentSeq: null,
+      type: "thinking",
+      payload: { thinking: "private chain of thought" },
+      createdAt: Date.now(),
+    });
+    await srv.built.runActivity.append(queued.runId!, {
+      seq: 2,
+      parentSeq: 1,
+      type: "tool_call",
+      payload: { tool: "mcp_private_service", callId: "private-call", command: "secret command" },
+      createdAt: Date.now(),
+    });
+    const presence = await fetch(`${srv.base}/v1/tlon/presence/runs`);
+    const presenceText = await presence.text();
+    assert.equal(presence.status, 200, presenceText);
+    assert.deepEqual(JSON.parse(presenceText), {
+      runs: [
+        {
+          runId: queued.runId,
+          accountId: id,
+          conversationId: "~zod",
+          status: "pending",
+          activeTools: ["tool"],
+        },
+      ],
+    });
+    assert.doesNotMatch(presenceText, /private|secret|command|thinking|call/);
+    assert.deepEqual(await (await fetch(`${srv.base}/v1/tlon/presence/runs/${id}/${queued.runId}`)).json(), {
+      runId: queued.runId,
+      accountId: id,
+      conversationId: "~zod",
+      status: "pending",
+      activeTools: ["tool"],
+    });
+    assert.equal((await fetch(`${srv.base}/v1/runs/${queued.runId}`)).status, 401);
+    const other = await srv.built.tlonInstallations.create("alice@example.com", {
+      ship: "~nec",
+      url: "https://other.example.com",
+      code: "other-code",
+      ownerShip: "~zod",
+    });
+    assert.equal((await fetch(`${srv.base}/v1/tlon/presence/runs/${other.id}/${queued.runId}`)).status, 404);
+    assert.equal(await srv.built.tlonInstallations.delete("alice@example.com", other.id), true);
 
     const deniedEdit = await fetch(`${srv.base}/v1/tlon/connections/${id}`, {
       method: "PUT",

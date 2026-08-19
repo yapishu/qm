@@ -34,6 +34,14 @@ export interface InboundMessage {
   text: string;
   kind: "dm" | "channel";
   target: string;
-  threadRoot: string;
+  threadRoot?: string;
   parentAuthor?: string;
+}
+
+export interface RunPresence {
+  runId: string;
+  accountId: string;
+  conversationId: string;
+  status: "pending" | "running" | "done" | "failed";
+  activeTools: string[];
 }

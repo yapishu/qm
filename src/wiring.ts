@@ -320,6 +320,7 @@ export interface BuiltApp {
   deploymentLayerRefresh: Sweeper;
   sessions: SessionStore;
   runs: RunStore;
+  runActivity: RunActivityStore;
   signals: RunSignalStore;
   tasks: TaskStore;
   sessionStateBus: SessionStateBus;
@@ -1498,6 +1499,7 @@ export function buildApp(
     deploymentLayerRefresh,
     sessions,
     runs,
+    runActivity,
     signals: runSignals,
     tasks,
     sessionStateBus,
@@ -1625,6 +1627,7 @@ export function serverDeps(
     deliveries: built.deliveries,
     ...(built.fireAskResolution ? { fireAskResolution: built.fireAskResolution } : {}),
     runs: built.runs,
+    runActivity: built.runActivity,
     workspace: built.workspace,
     files: built.files,
     memory: built.memory,

@@ -18,6 +18,7 @@ import type { AuditLog } from "../audit/audit-log.ts";
 import type { ErrorLog } from "../admin/error-log.ts";
 import type { MetricsSink } from "../admin/metrics-sink.ts";
 import type { RunStore } from "../runs/run-store.ts";
+import type { RunActivityStore } from "../runs/run-activity-store.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { FileArtifactStore } from "../files/file-artifact-store.ts";
 import type { MemoryService } from "../memory/memory-service.ts";
@@ -104,6 +105,7 @@ export interface ServerDeps {
   metrics?: MetricsSink;
   crons?: CronStore;
   runs?: RunStore;
+  runActivity?: RunActivityStore;
   workspace?: WorkspaceStore;
   files?: FileArtifactStore;
   memory?: MemoryService;

@@ -1,20 +1,27 @@
 import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
-import type { Delivery, InboundMessage, Installation } from "./types.ts";
+import type { Delivery, InboundMessage, Installation, RunPresence } from "./types.ts";
 import { encodeDeliveryTarget } from "./target.ts";
+
+export function conversationThreadRef(message: InboundMessage): string {
+  const timeline = `tlon:${message.accountId}:${message.kind}:${message.target}`;
+  return message.threadRoot ? `${timeline}:thread:${message.threadRoot}` : timeline;
+}
 
 export class CoreClient {
   private readonly baseUrl: string;
   private readonly secret: string | undefined;
+  private readonly fetchImpl: typeof fetch;
 
-  constructor(baseUrl: string, secret: string | undefined) {
+  constructor(baseUrl: string, secret: string | undefined, fetchImpl: typeof fetch = fetch) {
     this.baseUrl = baseUrl;
     this.secret = secret;
+    this.fetchImpl = fetchImpl;
   }
 
   private async request<T>(method: "GET" | "POST", rawPath: string, body?: unknown): Promise<T> {
     const path = withSourceAuthNonce(rawPath, this.secret);
     const rawBody = body === undefined ? "" : JSON.stringify(body);
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method,
       headers: signedHeaders(this.secret, method, path, rawBody),
       ...(body === undefined ? {} : { body: rawBody }),
@@ -39,7 +46,7 @@ export class CoreClient {
     });
   }
 
-  async turn(message: InboundMessage): Promise<void> {
+  async turn(message: InboundMessage): Promise<{ runId: string }> {
     const target = encodeDeliveryTarget({
       accountId: message.accountId,
       kind: message.kind,
@@ -48,16 +55,13 @@ export class CoreClient {
       ...(message.parentAuthor ? { parentAuthor: message.parentAuthor } : {}),
     });
     const channelName = message.kind === "channel" ? message.target.split("/").at(-1) : undefined;
-    await this.request("POST", "/v1/turns?async=1", {
+    const result = await this.request<{ status?: string; runId?: string }>("POST", "/v1/turns?async=1", {
       surface: "tlon",
       deliveryTarget: target,
       actor: { externalId: message.principalId, displayName: message.senderShip },
       conversation: {
         kind: message.kind === "dm" ? "dm" : "channel",
-        threadRef:
-          message.kind === "dm"
-            ? `tlon:${message.accountId}:dm:${message.target}:${message.threadRoot}`
-            : `tlon:${message.accountId}:channel:${message.target}:${message.threadRoot}`,
+        threadRef: conversationThreadRef(message),
         ...(message.kind === "channel"
           ? { channelRef: `tlon:${message.accountId}:${message.target}`, channelName }
           : { isPrivate: true }),
@@ -69,6 +73,18 @@ export class CoreClient {
       liveActor: true,
       async: true,
     });
+    if (result.status !== "queued" || !result.runId) throw new Error("core returned an invalid queued Tlon turn");
+    return { runId: result.runId };
+  }
+
+  async presenceRuns(): Promise<RunPresence[]> {
+    const result = await this.request<{ runs?: RunPresence[] }>("GET", "/v1/tlon/presence/runs");
+    if (!Array.isArray(result.runs)) throw new Error("core returned an invalid Tlon presence run list");
+    return result.runs;
+  }
+
+  run(accountId: string, runId: string): Promise<RunPresence> {
+    return this.request("GET", `/v1/tlon/presence/runs/${encodeURIComponent(accountId)}/${encodeURIComponent(runId)}`);
   }
 
   async deliveries(): Promise<Delivery[]> {

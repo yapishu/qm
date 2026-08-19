@@ -159,6 +159,10 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
       return [...ids];
     },
 
+    async listActive() {
+      return [...runs.values()].filter((run) => !isTerminal(run.status)).sort((a, b) => a.createdAt - b.createdAt);
+    },
+
     async list({ limit = 200 }: { limit?: number } = {}) {
       return [...runs.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, limit);
     },
