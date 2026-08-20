@@ -4,6 +4,8 @@ import { MAX_TLON_ATTACHMENT_BYTES, readResponseBytes } from "./attachments.ts";
 import type { Delivery, InboundMessage, InboundRecord, Installation, RunPresence } from "./types.ts";
 import { encodeDeliveryTarget } from "./target.ts";
 
+const COMPLETED_TURN_STATUSES = new Set(["ok", "failed", "pending_approval", "silent", "react"]);
+
 class CoreRequestError extends Error {
   readonly status: number;
 
@@ -91,7 +93,7 @@ export class CoreClient {
     await this.request("POST", `/v1/tlon/installations/${encodeURIComponent(id)}/release`, { version, token });
   }
 
-  async turn(message: InboundMessage, signal?: AbortSignal): Promise<{ runId: string }> {
+  async turn(message: InboundMessage, signal?: AbortSignal): Promise<void> {
     const target = encodeDeliveryTarget({
       accountId: message.accountId,
       accountVersion: message.installationVersion,
@@ -134,8 +136,15 @@ export class CoreClient {
       },
       signal,
     );
-    if (result.status !== "queued" || !result.runId) throw new Error("core returned an invalid queued Tlon turn");
-    return { runId: result.runId };
+    if (
+      result.status === "queued" &&
+      typeof result.runId === "string" &&
+      result.runId.length > 0 &&
+      result.runId === result.runId.trim()
+    )
+      return;
+    if (result.status && COMPLETED_TURN_STATUSES.has(result.status)) return;
+    throw new Error("core returned an invalid Tlon turn result");
   }
 
   async enqueueInbound(message: InboundMessage, previousId?: string, signal?: AbortSignal): Promise<string> {

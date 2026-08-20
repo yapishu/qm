@@ -25,11 +25,9 @@ test("top-level Tlon turns share a timeline and only explicit replies create thr
 
   assert.equal(conversationThreadRef(topLevel), "tlon:channel:chat%2F~zod%2FGeneral");
   assert.equal(conversationThreadRef({ ...topLevel, accountId: "sales" }), conversationThreadRef(topLevel));
-  assert.deepEqual(await client.turn(topLevel), { runId: "run-1" });
-  assert.deepEqual(await client.turn({ ...topLevel, messageId: "message-2", threadRoot: "root-1" }), {
-    runId: "run-2",
-  });
-  assert.deepEqual(await client.turn({ ...topLevel, installationVersion: "2" }), { runId: "run-3" });
+  await client.turn(topLevel);
+  await client.turn({ ...topLevel, messageId: "message-2", threadRoot: "root-1" });
+  await client.turn({ ...topLevel, installationVersion: "2" });
 
   const first = bodies[0] as {
     deliveryTarget: string;
@@ -63,6 +61,27 @@ test("top-level Tlon turns share a timeline and only explicit replies create thr
     "tlon:channel:chat%2F~zod%2FGeneral:~zod:message-1",
   );
   assert.equal(third.idempotencyKey, "tlon:channel:chat%2F~zod%2FGeneral:~zod:message-1");
+});
+
+test("completed idempotent Tlon turns are accepted as durable replays", async () => {
+  const results = [
+    { status: "queued", runId: "run-1" },
+    ...["ok", "failed", "pending_approval", "silent", "react"].map((status) => ({ status })),
+  ];
+  const client = new CoreClient("http://core:8080", undefined, (async () =>
+    Response.json(results.shift())) as typeof fetch);
+  for (let i = 0; i < 6; i++) {
+    await client.turn(topLevel);
+  }
+  assert.equal(results.length, 0);
+});
+
+test("malformed queued Tlon turns are rejected", async () => {
+  for (const runId of [undefined, 123, true, {}, "", "   ", " run-1", "run-1 "]) {
+    const client = new CoreClient("http://core:8080", undefined, (async () =>
+      Response.json({ status: "queued", runId }, { status: 202 })) as typeof fetch);
+    await assert.rejects(client.turn(topLevel), /invalid Tlon turn result/);
+  }
 });
 
 test("connection reports include the ship-verified channel set", async () => {
