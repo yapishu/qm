@@ -6,12 +6,33 @@ import { encodeDeliveryTarget } from "./target.ts";
 
 const COMPLETED_TURN_STATUSES = new Set(["ok", "failed", "pending_approval", "silent", "react"]);
 
+export function tlonApprovalCommand(
+  message: Pick<InboundMessage, "kind" | "text">,
+): { requestId: string; controlId: string; approved: boolean; scope?: "once" | "session" | "always" } | null {
+  if (message.kind !== "dm") return null;
+  const match = message.text
+    .trim()
+    .match(/^\/qm\s+(approve|deny)\s+([a-f0-9]{16}):([a-f0-9]{16})(?:\s+(once|session|always))?$/i);
+  if (!match) return null;
+  const action = match[1]!.toLowerCase();
+  const scope = match[4]?.toLowerCase() as "once" | "session" | "always" | undefined;
+  if (action === "deny" && scope) return null;
+  return {
+    requestId: match[2]!.toLowerCase(),
+    controlId: match[3]!.toLowerCase(),
+    approved: action === "approve",
+    ...(action === "approve" ? { scope: scope ?? "once" } : {}),
+  };
+}
+
 class CoreRequestError extends Error {
   readonly status: number;
+  readonly refusalCode: string | undefined;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, refusalCode?: string) {
     super(message);
     this.status = status;
+    this.refusalCode = refusalCode;
   }
 }
 
@@ -43,11 +64,21 @@ export class CoreClient {
       ...(body === undefined ? {} : { body: rawBody }),
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     });
-    if (!response.ok)
+    if (!response.ok) {
+      const text = await response.text();
+      let refusalCode: string | undefined;
+      try {
+        const parsed = JSON.parse(text) as { refusalCode?: unknown };
+        if (typeof parsed.refusalCode === "string") refusalCode = parsed.refusalCode;
+      } catch {
+        refusalCode = undefined;
+      }
       throw new CoreRequestError(
         response.status,
-        `${method} ${rawPath} failed with HTTP ${response.status}: ${await response.text()}`,
+        `${method} ${rawPath} failed with HTTP ${response.status}: ${text}`,
+        refusalCode,
       );
+    }
     return (await response.json()) as T;
   }
 
@@ -102,40 +133,61 @@ export class CoreClient {
       ...(message.threadRoot ? { replyTo: message.threadRoot } : {}),
       ...(message.parentAuthor ? { parentAuthor: message.parentAuthor } : {}),
     });
+    const approvalTarget = encodeDeliveryTarget({
+      accountId: message.accountId,
+      accountVersion: message.installationVersion,
+      kind: "dm",
+      target: message.senderShip,
+    });
+    const approvalQueueKey = `tlon:${message.accountId}:${message.installationVersion}`;
+    const approval = tlonApprovalCommand(message);
     const channelName = message.kind === "channel" ? message.target.split("/").at(-1) : undefined;
-    const result = await this.request<{ status?: string; runId?: string }>(
-      "POST",
-      "/v1/turns?async=1",
-      {
-        surface: "tlon",
-        deliveryTarget: target,
-        deliveryQueueKey:
-          message.kind === "channel"
-            ? `tlon:channel:${encodeURIComponent(message.target)}`
-            : `tlon:${message.accountId}:${message.installationVersion}`,
-        actor: { externalId: message.principalId, displayName: message.principalId },
-        conversation: {
-          kind: message.kind === "dm" ? "dm" : "channel",
-          threadRef: conversationThreadRef(message),
-          ...(message.kind === "channel"
-            ? { channelRef: `tlon:${encodeURIComponent(message.target)}`, channelName, isPrivate: true }
-            : { isPrivate: true }),
+    let result: { status?: string; runId?: string };
+    try {
+      result = await this.request<{ status?: string; runId?: string }>(
+        "POST",
+        "/v1/turns?async=1",
+        {
+          surface: "tlon",
+          deliveryTarget: target,
+          approvalDeliveryTarget: approvalTarget,
+          deliveryQueueKey:
+            message.kind === "channel" ? `tlon:channel:${encodeURIComponent(message.target)}` : approvalQueueKey,
+          approvalDeliveryQueueKey: approvalQueueKey,
+          actor: { externalId: message.principalId, displayName: message.principalId },
+          conversation: {
+            kind: message.kind === "dm" ? "dm" : "channel",
+            threadRef: conversationThreadRef(message),
+            ...(message.kind === "channel"
+              ? { channelRef: `tlon:${encodeURIComponent(message.target)}`, channelName, isPrivate: true }
+              : { isPrivate: true }),
+          },
+          text: message.text,
+          ...(approval ? { approval } : {}),
+          ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+          ...(message.inboundNotes?.length ? { inboundNotes: message.inboundNotes } : {}),
+          ...(message.externalPromptData?.length ? { externalPromptData: message.externalPromptData } : {}),
+          triggerTs: message.messageId,
+          idempotencyKey:
+            message.kind === "channel"
+              ? `tlon:channel:${encodeURIComponent(message.target)}:${encodeURIComponent(message.senderShip)}:${message.messageId}`
+              : `tlon:${message.accountId}:${message.installationVersion}:${message.messageId}`,
+          addressed: true,
+          liveActor: true,
+          async: true,
         },
-        text: message.text,
-        ...(message.attachments?.length ? { attachments: message.attachments } : {}),
-        ...(message.inboundNotes?.length ? { inboundNotes: message.inboundNotes } : {}),
-        ...(message.externalPromptData?.length ? { externalPromptData: message.externalPromptData } : {}),
-        triggerTs: message.messageId,
-        idempotencyKey:
-          message.kind === "channel"
-            ? `tlon:channel:${encodeURIComponent(message.target)}:${encodeURIComponent(message.senderShip)}:${message.messageId}`
-            : `tlon:${message.accountId}:${message.installationVersion}:${message.messageId}`,
-        addressed: true,
-        liveActor: true,
-        async: true,
-      },
-      signal,
-    );
+        signal,
+      );
+    } catch (error) {
+      if (
+        approval &&
+        error instanceof CoreRequestError &&
+        error.status === 403 &&
+        error.refusalCode === "stale_approval"
+      )
+        return;
+      throw error;
+    }
     if (
       result.status === "queued" &&
       typeof result.runId === "string" &&

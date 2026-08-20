@@ -31,6 +31,10 @@ const putPolicy = (base: string, b: unknown) =>
     body: JSON.stringify(b),
   });
 
+function tlonDmTarget(accountId: string, accountVersion: string, ship: string): string {
+  return Buffer.from(JSON.stringify({ accountId, accountVersion, kind: "dm", target: ship })).toString("base64url");
+}
+
 test("a pending approval survives a surface restart: GET /v1/approvals/:id returns a replayable request", async () => {
   const srv = start();
   try {
@@ -99,6 +103,116 @@ test("a pending approval survives a surface restart: GET /v1/approvals/:id retur
       `${srv.base}/v1/approvals/pending?threadRef=${encodeURIComponent(turn.conversation.threadRef)}`,
     );
     assert.equal(((await pendingGone.json()) as { pending?: unknown }).pending, null);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("a Tlon DM approval prompt resumes the stored turn instead of treating the button text as a new prompt", async () => {
+  const srv = start();
+  try {
+    const command = "git push --force origin main";
+    const deliveryTarget = tlonDmTarget("account-u3", "version-u3", "~zod");
+    const deliveryQueueKey = "tlon:account-u3:version-u3";
+    srv.built.tlonInstallations.runtimeVersions = async () => [{ id: "account-u3", version: "version-u3" }];
+    const original = {
+      surface: "tlon",
+      deliveryTarget,
+      approvalDeliveryTarget: deliveryTarget,
+      deliveryQueueKey,
+      approvalDeliveryQueueKey: deliveryQueueKey,
+      actor: { externalId: "U3", displayName: "Carol" },
+      conversation: { kind: "dm", threadRef: "tlon:account:dm:~zod", isPrivate: true },
+      text: `!run ${command}`,
+    };
+    const first = await fetch(`${srv.base}/v1/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(original),
+    });
+    const pending = (await first.json()) as {
+      status: string;
+      pendingApprovals?: Array<{ requestId: string; controlId: string }>;
+    };
+    assert.equal(pending.status, "pending_approval");
+    const requestId = pending.pendingApprovals?.[0]?.requestId;
+    const controlId = pending.pendingApprovals?.[0]?.controlId;
+    assert.ok(requestId);
+    assert.ok(controlId);
+    await new Promise((resolve) => setImmediate(resolve));
+    const prompts = await srv.built.deliveries.pending("tlon");
+    assert.equal(prompts.length, 1);
+    assert.equal(prompts[0]?.destination.target, deliveryTarget);
+    assert.equal(prompts[0]?.destination.approvalRequests?.[0]?.requestId, requestId);
+    assert.equal(prompts[0]?.destination.approvalRequests?.[0]?.controlId, controlId);
+    const storedApproval = await srv.built.app.getApproval(requestId);
+    assert.ok(storedApproval?.sourceRunId);
+    assert.equal(prompts[0]?.idempotencyKey, `approval:${storedApproval.sourceRunId}:${storedApproval.controlId}`);
+
+    const approved = await fetch(`${srv.base}/v1/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...original,
+        text: `/qm approve ${requestId}:${controlId} once`,
+        approval: { requestId, controlId, approved: true, scope: "once" },
+        idempotencyKey: "tlon:account:version:approval-message",
+      }),
+    });
+    const result = (await approved.json()) as { status: string };
+    assert.equal(result.status, "ok");
+    assert.equal(await srv.built.app.getApproval(requestId), null);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("an old Tlon approval card cannot resolve a later occurrence of the same command", async () => {
+  const srv = start();
+  try {
+    const deliveryTarget = tlonDmTarget("account-u4", "version-u4", "~nec");
+    srv.built.tlonInstallations.runtimeVersions = async () => [{ id: "account-u4", version: "version-u4" }];
+    const original = {
+      surface: "tlon",
+      deliveryTarget,
+      approvalDeliveryTarget: deliveryTarget,
+      deliveryQueueKey: "tlon:account-u4:version-u4",
+      approvalDeliveryQueueKey: "tlon:account-u4:version-u4",
+      actor: { externalId: "U4", displayName: "Dana" },
+      conversation: { kind: "dm", threadRef: "tlon:account:dm:~nec", isPrivate: true },
+      text: "!run git push --force origin main",
+    };
+    const request = async (body: unknown): Promise<{ status: number; body: Record<string, unknown> }> => {
+      const response = await fetch(`${srv.base}/v1/turns`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+    };
+    const first = await request(original);
+    const firstApproval = (first.body.pendingApprovals as Array<{ requestId: string; controlId: string }>)[0]!;
+    const denied = await request({
+      ...original,
+      text: `/qm deny ${firstApproval.requestId}:${firstApproval.controlId}`,
+      approval: { ...firstApproval, approved: false },
+    });
+    assert.equal(denied.status, 403);
+
+    const second = await request(original);
+    const secondApproval = (second.body.pendingApprovals as Array<{ requestId: string; controlId: string }>)[0]!;
+    assert.equal(secondApproval.requestId, firstApproval.requestId);
+    assert.notEqual(secondApproval.controlId, firstApproval.controlId);
+
+    const stale = await request({
+      ...original,
+      text: `/qm approve ${firstApproval.requestId}:${firstApproval.controlId} always`,
+      approval: { ...firstApproval, approved: true, scope: "always" },
+    });
+    assert.equal(stale.status, 403);
+    assert.equal(stale.body.refusalCode, "stale_approval");
+    const current = await srv.built.app.getApproval(secondApproval.requestId);
+    assert.equal(current?.controlId, secondApproval.controlId);
   } finally {
     await srv.close();
   }

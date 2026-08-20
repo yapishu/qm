@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { conversationThreadRef, CoreClient } from "../src/core.ts";
+import { conversationThreadRef, CoreClient, tlonApprovalCommand } from "../src/core.ts";
 import { decodeDeliveryTarget } from "../src/target.ts";
 import type { InboundMessage } from "../src/types.ts";
 
@@ -74,6 +74,92 @@ test("completed idempotent Tlon turns are accepted as durable replays", async ()
     await client.turn(topLevel);
   }
   assert.equal(results.length, 0);
+});
+
+test("Tlon approval commands are exact DM-only control messages", () => {
+  assert.deepEqual(tlonApprovalCommand({ kind: "dm", text: "/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once" }), {
+    requestId: "9e45ee0714522db5",
+    controlId: "4a92d7cf1268fe31",
+    approved: true,
+    scope: "once",
+  });
+  assert.deepEqual(tlonApprovalCommand({ kind: "dm", text: "/QM APPROVE 9E45EE0714522DB5:4A92D7CF1268FE31 always" }), {
+    requestId: "9e45ee0714522db5",
+    controlId: "4a92d7cf1268fe31",
+    approved: true,
+    scope: "always",
+  });
+  assert.deepEqual(tlonApprovalCommand({ kind: "dm", text: "/qm deny 9e45ee0714522db5:4a92d7cf1268fe31" }), {
+    requestId: "9e45ee0714522db5",
+    controlId: "4a92d7cf1268fe31",
+    approved: false,
+  });
+  for (const input of [
+    { kind: "channel" as const, text: "/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once" },
+    { kind: "dm" as const, text: "/qm approve 9e45ee0714522db5 once" },
+    { kind: "dm" as const, text: "/qm deny 9e45ee0714522db5:4a92d7cf1268fe31 once" },
+    { kind: "dm" as const, text: "please /qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once" },
+  ]) {
+    assert.equal(tlonApprovalCommand(input), null);
+  }
+});
+
+test("Tlon approval buttons resume through the requester's durable DM route", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new CoreClient("http://core:8080", undefined, (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({ status: "queued", runId: "approval-run" }, { status: 202 });
+  }) as typeof fetch);
+  await client.turn({
+    ...topLevel,
+    kind: "dm",
+    target: "~zod",
+    senderShip: "~zod",
+    text: "/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 session",
+  });
+  assert.deepEqual(body.approval, {
+    requestId: "9e45ee0714522db5",
+    controlId: "4a92d7cf1268fe31",
+    approved: true,
+    scope: "session",
+  });
+  assert.equal(body.approvalDeliveryTarget, body.deliveryTarget);
+  assert.equal(body.approvalDeliveryQueueKey, "tlon:support:1");
+});
+
+test("expired Tlon approval controls are consumed without poisoning the DM queue", async () => {
+  const client = new CoreClient("http://core:8080", undefined, (async () =>
+    Response.json(
+      {
+        status: "refused",
+        refusalCode: "stale_approval",
+        reason: "that approval request is no longer available",
+      },
+      { status: 403 },
+    )) as typeof fetch);
+  await client.turn({
+    ...topLevel,
+    kind: "dm",
+    target: "~zod",
+    text: "/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once",
+  });
+});
+
+test("unrelated Tlon approval refusals remain retryable", async () => {
+  const client = new CoreClient("http://core:8080", undefined, (async () =>
+    Response.json(
+      { status: "refused", reason: "shared context membership changed; retry" },
+      { status: 403 },
+    )) as typeof fetch);
+  await assert.rejects(
+    client.turn({
+      ...topLevel,
+      kind: "dm",
+      target: "~zod",
+      text: "/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once",
+    }),
+    /HTTP 403/,
+  );
 });
 
 test("malformed queued Tlon turns are rejected", async () => {

@@ -23,13 +23,28 @@ export interface DeliveryTarget {
 
 export interface Delivery {
   id: string;
-  destination: { type: string; target: string; scopeVersion?: string };
+  destination: {
+    type: string;
+    target: string;
+    scopeVersion?: string;
+    approvalRequests?: ApprovalRequest[];
+  };
   text: string;
   attachments?: OutgoingAttachment[];
   idempotencyKey: string;
   createdAt: number;
   claimToken?: string;
   connectorRef: number;
+}
+
+export interface ApprovalRequest {
+  requestId: string;
+  controlId?: string;
+  command: string;
+  reason: string;
+  purpose?: string;
+  summary?: string;
+  grantModes?: { session: boolean; always: boolean };
 }
 
 export interface IncomingAttachment {

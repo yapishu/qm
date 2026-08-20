@@ -11,6 +11,7 @@ import {
 } from "../../surfaces/tlon-installation.ts";
 import type { Run } from "../../runs/run-store.ts";
 import type { RunActivityEntry } from "../../runs/run-activity-store.ts";
+import { decodeTlonDeliveryTarget } from "../../surfaces/tlon-delivery-target.ts";
 
 const RUNTIME_STATUSES = new Set<TlonRuntimeStatus>(["pending", "connecting", "connected", "error", "stopped"]);
 
@@ -23,27 +24,15 @@ interface TlonRunTarget {
 
 function tlonRunTarget(run: Run): TlonRunTarget | null {
   if (run.request.surface !== "tlon" || !run.request.deliveryTarget) return null;
-  try {
-    const target = JSON.parse(Buffer.from(run.request.deliveryTarget, "base64url").toString("utf8")) as Record<
-      string,
-      unknown
-    >;
-    if (
-      typeof target.accountId !== "string" ||
-      typeof target.accountVersion !== "string" ||
-      (target.kind !== "dm" && target.kind !== "channel") ||
-      typeof target.target !== "string"
-    )
-      return null;
-    return {
-      accountId: target.accountId,
-      accountVersion: target.accountVersion,
-      conversationId: target.target,
-      kind: target.kind,
-    };
-  } catch {
-    return null;
-  }
+  const target = decodeTlonDeliveryTarget(run.request.deliveryTarget);
+  return target
+    ? {
+        accountId: target.accountId,
+        accountVersion: target.accountVersion,
+        conversationId: target.target,
+        kind: target.kind,
+      }
+    : null;
 }
 
 function presenceToolName(value: unknown): string {

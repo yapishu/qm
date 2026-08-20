@@ -56,6 +56,37 @@ export function createTurnMethods(
   return {
     async turn(req: TurnRequest): Promise<TurnResult> {
       await deps.identity.refresh();
+      if (req.surface === "tlon" && req.approval) {
+        const pending = await deps.approvals?.get(req.approval.requestId);
+        const replay = pending?.request;
+        if (
+          !pending ||
+          !(await approvalRecordIsCurrent(pending)) ||
+          !replay ||
+          replay.surface !== "tlon" ||
+          req.conversation.kind !== "dm" ||
+          !pending.controlId ||
+          pending.controlId !== req.approval.controlId ||
+          replay.actor.externalId !== req.actor.externalId ||
+          !replay.approvalDeliveryTarget ||
+          replay.approvalDeliveryTarget !== req.deliveryTarget ||
+          replay.approvalDeliveryQueueKey !== req.deliveryQueueKey
+        ) {
+          return {
+            status: "refused",
+            refusalCode: "stale_approval",
+            reason: "that approval request is no longer available",
+          };
+        }
+        req = {
+          ...replay,
+          actor: req.actor,
+          approval: req.approval,
+          ...(req.triggerTs ? { triggerTs: req.triggerTs } : {}),
+          ...(req.idempotencyKey ? { idempotencyKey: req.idempotencyKey } : {}),
+          ...(req.async ? { async: true } : {}),
+        };
+      }
       const actor: Principal = deps.identity.resolve(req.actor);
       if (!deps.identity.isInternal(actor)) {
         return { status: "refused", reason: "internal-only: non-internal principals cannot interact" };
@@ -279,7 +310,9 @@ export function createTurnMethods(
       const input = {
         surface: req.surface,
         ...(req.deliveryTarget ? { deliveryTarget: req.deliveryTarget } : {}),
+        ...(req.approvalDeliveryTarget ? { approvalDeliveryTarget: req.approvalDeliveryTarget } : {}),
         ...(req.deliveryQueueKey ? { deliveryQueueKey: req.deliveryQueueKey } : {}),
+        ...(req.approvalDeliveryQueueKey ? { approvalDeliveryQueueKey: req.approvalDeliveryQueueKey } : {}),
         ...(req.deliveryCandidates?.length ? { deliveryCandidates: req.deliveryCandidates } : {}),
         actor,
         conversation,

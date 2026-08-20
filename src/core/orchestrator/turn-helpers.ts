@@ -231,7 +231,9 @@ export function replayableRequest(input: OrchestratorInput): TurnRequest {
     surface: input.surface ?? "unknown",
     ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
     ...(input.deliveryTarget ? { deliveryTarget: input.deliveryTarget } : {}),
+    ...(input.approvalDeliveryTarget ? { approvalDeliveryTarget: input.approvalDeliveryTarget } : {}),
     ...(input.deliveryQueueKey ? { deliveryQueueKey: input.deliveryQueueKey } : {}),
+    ...(input.approvalDeliveryQueueKey ? { approvalDeliveryQueueKey: input.approvalDeliveryQueueKey } : {}),
     ...(input.deliveryCandidates?.length ? { deliveryCandidates: input.deliveryCandidates } : {}),
     actor: principalAssertion(input.actor),
     conversation: {

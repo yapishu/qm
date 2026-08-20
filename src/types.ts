@@ -166,6 +166,7 @@ export interface Destination {
   target: string;
   queueKey?: string;
   scopeVersion?: string;
+  approvalRequests?: PendingApproval[];
   audienceScopeId?: ScopeId;
   onBehalfOf?: string;
   editRef?: string;
@@ -395,7 +396,9 @@ export interface TurnRequest {
   surface: string;
   scopeVersion?: string;
   deliveryTarget?: string;
+  approvalDeliveryTarget?: string;
   deliveryQueueKey?: string;
+  approvalDeliveryQueueKey?: string;
   deliveryCandidates?: { target: string; label: string }[];
   actor: ActorAssertion;
   conversation: {
@@ -443,7 +446,7 @@ export interface TurnRequest {
   timezone?: string;
   intakePreambleMs?: number;
   clientSentAt?: number;
-  approval?: { requestId: string; approved: boolean; scope?: ApprovalScope };
+  approval?: { requestId: string; controlId?: string; approved: boolean; scope?: ApprovalScope };
   proactiveOpener?: boolean;
   spawned?: boolean;
   idempotencyKey?: string;
@@ -460,6 +463,7 @@ export interface ActorAssertion {
 
 export interface PendingApproval {
   requestId: string;
+  controlId?: string;
   command: string;
   reason: string;
   matched?: string;
@@ -473,6 +477,8 @@ export interface PendingApproval {
 
 export interface PendingApprovalRecord {
   sessionId: string;
+  sourceRunId?: string;
+  controlId?: string;
   command: string;
   createdAt?: number;
   reason?: string;
@@ -509,6 +515,7 @@ export interface TurnResult {
   reactions?: string[];
   reason?: string;
   refusalKind?: "security_quarantine";
+  refusalCode?: "stale_approval";
   adminUrl?: string;
   runId?: string;
   steered?: true;

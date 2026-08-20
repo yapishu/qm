@@ -61,7 +61,7 @@ import { createPostgresBudgetTracker } from "./ratelimit/postgres-budget.ts";
 import { createCronStore, type CronStore } from "./cron/cron-store.ts";
 import { createDeliveryStore, type DeliveryStore } from "./delivery/delivery-store.ts";
 import { createPostgresDeliveryStore } from "./delivery/postgres-delivery-store.ts";
-import { wireRunResultDeliveries } from "./delivery/run-result-delivery.ts";
+import { reconcileTlonApprovalDeliveries, wireRunResultDeliveries } from "./delivery/run-result-delivery.ts";
 import { createDirectoryStore, type DirectoryStore } from "./directory/directory-store.ts";
 import { createPostgresDirectoryStore } from "./directory/postgres-directory-store.ts";
 import {
@@ -1117,6 +1117,11 @@ export function buildApp(
   const orchestrator = createOrchestrator(orchestratorDeps);
 
   wireRunResultDeliveries(runs, deliveries, tasks);
+  const approvalDeliverySweeper = createSweeper(
+    () => reconcileTlonApprovalDeliveries(approvals, deliveries, runs, tlonInstallations),
+    config.reaperIntervalMs,
+    { label: "tlon-approval-deliveries", immediate: true },
+  );
   const idempotency = createIdempotencyStore(artifactMap<IdempotencyRecord>("idempotency"));
   const skillFetcher = createGitFetcher(
     keychain
@@ -1509,6 +1514,7 @@ export function buildApp(
       reachDeniedNotifier?.start(config.insightsIntervalMs);
       wakeSweep.start();
       orphanedSignalSweeper.start();
+      approvalDeliverySweeper.start();
       drain.start();
     },
     async releaseInFlightRuns() {
@@ -1525,6 +1531,7 @@ export function buildApp(
       blobSweeper.stop();
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
+      approvalDeliverySweeper.stop();
       await Promise.all(workers.map((w) => w.stop(config.shutdownDrainMs))).catch(
         swallowAs("wiring: worker drain failed", undefined),
       );

@@ -28,6 +28,7 @@ import { samePerson } from "../directory/person.ts";
 import type { Deployment } from "../deploy/deploy-store.ts";
 import { swallow } from "../util/errors.ts";
 import { commandApprovalId } from "../core/approval-id.ts";
+import { decodeTlonDeliveryTarget } from "../surfaces/tlon-delivery-target.ts";
 import {
   openGroupViaSurface,
   resolveReachTarget,
@@ -94,6 +95,14 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   async function approvalRecordIsCurrent(record: PendingApprovalRecord, knownSession?: Session): Promise<boolean> {
+    if (record.request?.surface === "tlon") {
+      const target = decodeTlonDeliveryTarget(record.request.approvalDeliveryTarget ?? record.request.deliveryTarget);
+      if (!target) return false;
+      const version = (await deps.tlonInstallations?.runtimeVersions())?.find(
+        (installation) => installation.id === target.accountId,
+      )?.version;
+      if (version !== target.accountVersion) return false;
+    }
     const session = knownSession ?? (await deps.sessions.get(record.sessionId));
     return !!session && approvalCurrentForSession(session, record);
   }
@@ -141,6 +150,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
       : candidates;
     return visible.map((r) => ({
       requestId: commandApprovalId(r.sessionId, r.command),
+      ...(r.controlId ? { controlId: r.controlId } : {}),
       command: r.command,
       reason: r.reason ?? "requires approval",
       ...(r.matched ? { matched: r.matched } : {}),

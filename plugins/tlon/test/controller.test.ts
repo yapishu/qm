@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TlonController } from "../src/controller.ts";
-import type { CoreClient } from "../src/core.ts";
+import { CoreClient } from "../src/core.ts";
 import { parseChannelMessage, parseDmMessage } from "../src/messages.ts";
 import { encodeDeliveryTarget } from "../src/target.ts";
-import { TlonConnection } from "../src/tlon.ts";
+import { approvalCardEntry, TlonConnection } from "../src/tlon.ts";
 import type { Delivery, InboundMessage, Installation } from "../src/types.ts";
 import type { Urbit } from "@tloncorp/api";
 
@@ -348,6 +348,179 @@ test("outbound Markdown is delivered as native Tlon rich text", async () => {
   assert.match(wire, /"inline-code":"code"/);
   assert.match(wire, /"listing":\{"list":\{"type":"unordered"/);
   assert.doesNotMatch(wire, /\*\*bold\*\*/);
+});
+
+test("approval deliveries include native Tlon actions with text-command fallback", async () => {
+  const pokes: Array<{ app: string; mark: string; json: unknown }> = [];
+  const client = {
+    nodeId: installation.ship,
+    on: () => client,
+    poke: async (poke: { app: string; mark: string; json: unknown }) => {
+      pokes.push(poke);
+    },
+  } as unknown as Urbit;
+  const connection = new TlonConnection(installation, async () => {});
+  (connection as unknown as { client: Urbit | null }).client = client;
+  const request = {
+    requestId: "9e45ee0714522db5",
+    controlId: "4a92d7cf1268fe31",
+    command: "rm -rf build",
+    reason: "recursive delete",
+    purpose: "replace the preview build",
+  };
+
+  assert.ok(approvalCardEntry([request]));
+  await connection.deliver({
+    id: "delivery-approval",
+    destination: {
+      type: "tlon",
+      target: deliveryTarget(),
+      approvalRequests: [request],
+    },
+    text: "Approval needed. Reply `/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once` or `/qm deny 9e45ee0714522db5:4a92d7cf1268fe31`.",
+    idempotencyKey: "approval:run-1:4a92d7cf1268fe31",
+    createdAt: 1,
+    connectorRef: 1_000_002,
+  });
+
+  const wire = JSON.stringify(pokes[0]!.json);
+  assert.match(wire, /qm-approval/);
+  assert.match(wire, /tlon\.a2ui\.basic\.v1/);
+  assert.match(wire, /\/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once/);
+  assert.match(wire, /\/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 session/);
+  assert.match(wire, /\/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 always/);
+  assert.match(wire, /\/qm deny 9e45ee0714522db5:4a92d7cf1268fe31/);
+});
+
+test("approval prompts validate their originating run before reaching the requester DM", async () => {
+  const delivered: Delivery[] = [];
+  const acknowledged: string[] = [];
+  const validatedRuns: string[] = [];
+  const leases: Array<[string, string, string | undefined, string | undefined]> = [];
+  const prompt: Delivery = {
+    id: "delivery-approval",
+    claimToken: "claim-approval",
+    destination: {
+      type: "tlon",
+      target: deliveryTarget(),
+      scopeVersion: "roster-1",
+      approvalRequests: [
+        {
+          requestId: "9e45ee0714522db5",
+          controlId: "4a92d7cf1268fe31",
+          command: "rm -rf build",
+          reason: "recursive delete",
+        },
+      ],
+    },
+    text: "Approval needed",
+    idempotencyKey: "approval:run-1:4a92d7cf1268fe31",
+    createdAt: 1,
+    connectorRef: 1_000_003,
+  };
+  const core = {
+    acquire: async (id: string, version: string, channel?: string, scopeVersion?: string) => {
+      leases.push([id, version, channel, scopeVersion]);
+      return `lease:${leases.length}`;
+    },
+    release: async () => {},
+    installations: async () => [installation],
+    report: async () => {},
+    presenceRuns: async () => [],
+    deliveries: async () => [prompt],
+    run: async (_accountId: string, runId: string) => {
+      validatedRuns.push(runId);
+      return { runId, conversationId: "chat/~zod/private", scopeVersion: "roster-1" };
+    },
+    ack: async (id: string) => {
+      acknowledged.push(id);
+    },
+  } as unknown as CoreClient;
+  const controller = new TlonController(core, (next) => ({
+    installation: next,
+    start: async () => {},
+    stop: async () => {},
+    runtimeStatus: () => ({ status: "connected" }),
+    deliver: async (delivery) => {
+      delivered.push(delivery);
+    },
+    enrichInbound,
+    publishPresence: async () => {},
+    clearPresence: async () => {},
+  }));
+  const internals = controller as unknown as { reconcile(): Promise<void>; deliverPending(): Promise<void> };
+  await internals.reconcile();
+  leases.length = 0;
+  await internals.deliverPending();
+  assert.deepEqual(delivered, [prompt]);
+  assert.deepEqual(acknowledged, [prompt.id]);
+  assert.deepEqual(validatedRuns, ["run-1"]);
+  assert.deepEqual(leases, [
+    [installation.id, installation.version, undefined, undefined],
+    [installation.id, installation.version, "chat/~zod/private", "roster-1"],
+    [installation.id, installation.version, undefined, undefined],
+  ]);
+});
+
+test("an approval prompt from a stale shared-room roster is acknowledged without reaching the requester DM", async () => {
+  const delivered: Delivery[] = [];
+  const acknowledged: string[] = [];
+  let acquireCalls = 0;
+  const prompt: Delivery = {
+    id: "delivery-stale-approval",
+    claimToken: "claim-stale-approval",
+    destination: {
+      type: "tlon",
+      target: deliveryTarget(),
+      scopeVersion: "roster-old",
+      approvalRequests: [
+        {
+          requestId: "9e45ee0714522db5",
+          controlId: "4a92d7cf1268fe31",
+          command: "rm -rf build",
+          reason: "recursive delete",
+        },
+      ],
+    },
+    text: "Approval needed",
+    idempotencyKey: "approval:run-stale:4a92d7cf1268fe31",
+    createdAt: 1,
+    connectorRef: 1_000_004,
+  };
+  const core = {
+    acquire: async () => (++acquireCalls === 1 ? "generic-lease" : null),
+    release: async () => {},
+    installations: async () => [installation],
+    report: async () => {},
+    presenceRuns: async () => [],
+    deliveries: async () => [prompt],
+    run: async () => ({
+      runId: "run-stale",
+      conversationId: "chat/~zod/private",
+      scopeVersion: "roster-old",
+    }),
+    ack: async (id: string) => {
+      acknowledged.push(id);
+    },
+  } as unknown as CoreClient;
+  const controller = new TlonController(core, (next) => ({
+    installation: next,
+    start: async () => {},
+    stop: async () => {},
+    runtimeStatus: () => ({ status: "connected" }),
+    deliver: async (delivery) => {
+      delivered.push(delivery);
+    },
+    enrichInbound,
+    publishPresence: async () => {},
+    clearPresence: async () => {},
+  }));
+  const internals = controller as unknown as { reconcile(): Promise<void>; deliverPending(): Promise<void> };
+  await internals.reconcile();
+  await internals.deliverPending();
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(acknowledged, [prompt.id]);
+  assert.equal(acquireCalls, 2);
 });
 
 test("concurrent deliveries keep independent authenticated request cancellation", async () => {
@@ -1142,6 +1315,76 @@ test("current-generation claims are released while their connection is starting"
   await internals.processInbound();
   await internals.deliverPending();
   assert.deepEqual(released, ["inbound:waiting-inbound", "delivery:waiting-delivery"]);
+});
+
+test("an expired approval click is acknowledged and does not block the next DM", async () => {
+  const acknowledged: string[] = [];
+  const turnBodies: Array<{ approval?: unknown; text?: unknown }> = [];
+  const stale: InboundMessage = {
+    accountId: installation.id,
+    installationVersion: installation.version,
+    principalId: installation.principalId,
+    messageId: "stale-approval",
+    senderShip: installation.ownerShip,
+    text: "/qm approve 9e45ee0714522db5:4a92d7cf1268fe31 once",
+    kind: "dm",
+    target: installation.ownerShip,
+  };
+  const next = { ...stale, messageId: "next-message", text: "hello after the old button" };
+  const records = [
+    { id: "stale-approval", queueKey: "dm:support", message: stale, createdAt: 1, claimToken: "claim-stale" },
+    {
+      id: "next-message",
+      queueKey: "dm:support",
+      message: next,
+      previousId: "stale-approval",
+      createdAt: 2,
+      claimToken: "claim-next",
+    },
+  ];
+  const core = new CoreClient("http://core:8080", undefined, (async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname !== "/v1/turns") return Response.json({ ok: true });
+    const body = JSON.parse(String(init?.body)) as { approval?: unknown; text?: unknown };
+    turnBodies.push(body);
+    return body.approval
+      ? Response.json(
+          {
+            status: "refused",
+            refusalCode: "stale_approval",
+            reason: "that approval request is no longer available",
+          },
+          { status: 403 },
+        )
+      : Response.json({ status: "queued", runId: "next-run" }, { status: 202 });
+  }) as typeof fetch);
+  Object.assign(core, {
+    ...operationLeases,
+    installations: async () => [installation],
+    report: async () => {},
+    inboundRecords: async () => records,
+    ackInbound: async (id: string) => {
+      acknowledged.push(id);
+    },
+  });
+  const controller = new TlonController(core, (current) => ({
+    installation: current,
+    start: async () => {},
+    stop: async () => {},
+    runtimeStatus: () => ({ status: "connected" }),
+    deliver: async () => {},
+    enrichInbound,
+    publishPresence: async () => {},
+    clearPresence: async () => {},
+  }));
+  const internals = controller as unknown as { reconcile(): Promise<void>; processInbound(): Promise<void> };
+  await internals.reconcile();
+  await internals.processInbound();
+  assert.deepEqual(acknowledged, ["stale-approval", "next-message"]);
+  assert.deepEqual(
+    turnBodies.map((body) => body.text),
+    [stale.text, next.text],
+  );
 });
 
 test("shutdown releases in-flight inbound and delivery claims", async () => {

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   appendFileUploadToPostBlob,
   appendVideoToPostBlob,
+  A2UI,
   clearConversationPresence,
   createComputingStatus,
   getGroups,
@@ -35,7 +36,7 @@ import {
   type MediaReference,
 } from "./attachments.ts";
 import { createPinnedOriginFetch, type PinnedOriginFetch } from "./network.ts";
-import type { Delivery, InboundMessage, Installation, OutgoingAttachment } from "./types.ts";
+import type { ApprovalRequest, Delivery, InboundMessage, Installation, OutgoingAttachment } from "./types.ts";
 import { decodeDeliveryTarget } from "./target.ts";
 import { markdownToStory } from "./story.ts";
 import { uploadTlonAttachment } from "./upload.ts";
@@ -100,7 +101,7 @@ function deliveryMarker(blob: string | null | undefined): string | undefined {
   }
 }
 
-function appendDeliveryMarker(blob: string | undefined, id: string): string {
+function appendBlobEntry(blob: string | undefined, entry: unknown): string {
   let entries: unknown[] = [];
   if (blob) {
     try {
@@ -110,7 +111,85 @@ function appendDeliveryMarker(blob: string | undefined, id: string): string {
       entries = [];
     }
   }
-  return JSON.stringify([...entries, { type: DELIVERY_MARKER_TYPE, version: 1, id }]);
+  return JSON.stringify([...entries, entry]);
+}
+
+function appendDeliveryMarker(blob: string | undefined, id: string): string {
+  return appendBlobEntry(blob, { type: DELIVERY_MARKER_TYPE, version: 1, id });
+}
+
+function clipped(value: string | undefined, limit: number): string {
+  const text = value?.trim() ?? "";
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+}
+
+export function approvalCardEntry(requests: ApprovalRequest[]): unknown | null {
+  const approvals = requests
+    .filter((approval) => typeof approval.controlId === "string" && /^[a-f0-9]{16}$/.test(approval.controlId))
+    .slice(0, 4);
+  if (!approvals.length) return null;
+  const components: Array<Record<string, unknown>> = [
+    { id: "label-once", component: "Text", text: "Allow once" },
+    { id: "label-session", component: "Text", text: "Allow session" },
+    { id: "label-always", component: "Text", text: "Allow always" },
+    { id: "label-deny", component: "Text", text: "Deny" },
+  ];
+  const cards: string[] = [];
+  for (const [index, approval] of approvals.entries()) {
+    const prefix = `approval-${index}`;
+    const details = [
+      clipped(approval.summary, 300),
+      approval.purpose ? `Why: ${clipped(approval.purpose, 300)}` : "",
+      `Command: ${clipped(approval.command, 500)}`,
+      `Flagged as: ${clipped(approval.reason, 200)}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const actions: string[] = [];
+    const control = `${approval.requestId}:${approval.controlId}`;
+    const button = (name: string, label: string, text: string, variant: string): void => {
+      const id = `${prefix}-${name}`;
+      actions.push(id);
+      components.push({
+        id,
+        component: "Button",
+        child: label,
+        variant,
+        action: { event: { name: A2UI.action.sendMessage, context: { text } } },
+      });
+    };
+    button("once", "label-once", `/qm approve ${control} once`, "primary");
+    if (approval.grantModes?.session !== false) {
+      button("session", "label-session", `/qm approve ${control} session`, "secondary");
+    }
+    if (approval.grantModes?.always !== false) {
+      button("always", "label-always", `/qm approve ${control} always`, "secondary");
+    }
+    button("deny", "label-deny", `/qm deny ${control}`, "secondary");
+    components.push(
+      { id: `${prefix}-title`, component: "Text", text: "Approval needed", variant: "h4" },
+      { id: `${prefix}-details`, component: "Text", text: details, variant: "body" },
+      { id: `${prefix}-actions`, component: "Row", children: actions, align: "center" },
+      {
+        id: `${prefix}-body`,
+        component: "Column",
+        children: [`${prefix}-title`, `${prefix}-details`, `${prefix}-actions`],
+      },
+      { id: `${prefix}-card`, component: "Card", child: `${prefix}-body` },
+    );
+    cards.push(`${prefix}-card`);
+  }
+  components.push({ id: "approval-root", component: "Column", children: cards });
+  const surfaceId = `qm-approval-${approvals.map((approval) => approval.requestId).join("-")}`;
+  const entry = {
+    type: "a2ui",
+    version: 1,
+    messages: [
+      { version: "v0.9", createSurface: { surfaceId, catalogId: "tlon.a2ui.basic.v1" } },
+      { version: "v0.9", updateComponents: { surfaceId, components, root: "approval-root" } },
+    ],
+  };
+  return A2UI.validateBlobEntry(entry) ? entry : null;
 }
 
 export function originLockedFetch(baseUrl: string, fetchImpl: typeof fetch = fetch): typeof fetch {
@@ -706,6 +785,8 @@ export class TlonConnection {
               content.push({ inline: [`Attachment ${name} could not be sent.`] });
             }
           }
+          const approvalCard = approvalCardEntry(delivery.destination.approvalRequests ?? []);
+          if (approvalCard) blob = appendBlobEntry(blob, approvalCard);
           if (!content.length) content.push({ inline: [""] });
           const sendSignal = AbortSignal.any([revocationSignal, AbortSignal.timeout(this.operationTimeoutMs)]);
           const replyTo = target.replyTo;

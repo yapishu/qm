@@ -64,7 +64,7 @@ import {
   UNSCREENED_REASON,
   unscreenedNotice,
 } from "../security/security-posture.ts";
-import { commandApprovalId } from "./approval-id.ts";
+import { commandApprovalControlId, commandApprovalId } from "./approval-id.ts";
 import { createPerTurnStrategy } from "../memory/strategies/per-turn.ts";
 import { DEFAULT_MEMORY_POLICY, recallMemoryScopes, writableMemoryScope } from "../memory/policy.ts";
 import { createMemoryMap } from "../persistence/durable-map.ts";
@@ -1368,6 +1368,18 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         });
         if (input.approval) {
           const p = await pending.get(input.approval.requestId);
+          if (
+            !p ||
+            p.sessionId !== session.id ||
+            (input.surface === "tlon" && (!p.controlId || p.controlId !== input.approval.controlId))
+          ) {
+            return {
+              status: "refused",
+              refusalCode: "stale_approval",
+              sessionId: session.id,
+              reason: "that approval request is no longer available",
+            };
+          }
           if (!input.approval.approved) {
             await pending.delete(input.approval.requestId);
             deps.auditLog.record({
@@ -1383,7 +1395,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               sessionId: session.id,
               reason: p?.command ? `approval denied for ${p.command}` : "approval denied",
             };
-          } else if (p && p.sessionId === session.id) {
+          } else {
             const scope = input.approval.scope ?? "once";
             if (scope !== "once" && !resolution.approvalGrantModes[scope]) {
               deps.auditLog.record({
@@ -2926,11 +2938,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             const blocks = approvalBlocksInput(pa.kind, outcome);
             const command = pa.command;
             const requestId = commandApprovalId(session.id, command);
+            const controlId = commandApprovalControlId(input.runId, requestId);
             const summary = await approvalSummary(scopeId, command, pa.reason, pa.purpose);
             prepared.push({
               requestId,
               record: {
                 sessionId: session.id,
+                ...(input.runId ? { sourceRunId: input.runId } : {}),
+                controlId,
                 command,
                 createdAt: Date.now(),
                 reason: pa.reason,
@@ -2945,6 +2960,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               },
               approval: {
                 requestId,
+                controlId,
                 command,
                 reason: pa.reason,
                 blocksInput: blocks,
@@ -3012,6 +3028,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         }
         if (err instanceof NeedsApproval) {
           const requestId = commandApprovalId(session.id, err.command);
+          const controlId = commandApprovalControlId(input.runId, requestId);
           const grantModesField =
             resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
               ? {}
@@ -3021,6 +3038,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             await withManagedRosterVersion(async () => {
               await pending.put(requestId, {
                 sessionId: session.id,
+                ...(input.runId ? { sourceRunId: input.runId } : {}),
+                controlId,
                 command: err.command,
                 createdAt: Date.now(),
                 reason: err.approvalReason,
@@ -3046,6 +3065,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           }
           const approval: PendingApproval = {
             requestId,
+            controlId,
             command: err.command,
             reason: err.approvalReason,
             ...grantModesField,

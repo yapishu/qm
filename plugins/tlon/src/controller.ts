@@ -581,8 +581,11 @@ export class TlonController {
             await this.core.releaseDelivery(delivery.id, delivery.claimToken);
             return false;
           }
-          const runId = delivery.idempotencyKey.startsWith("run:") ? delivery.idempotencyKey.slice("run:".length) : "";
-          const sourceToken = await this.core.acquire(target.accountId, target.accountVersion);
+          const approvalRunId = /^approval:([^:]+):[a-f0-9]{16}$/.exec(delivery.idempotencyKey)?.[1];
+          const runId = delivery.idempotencyKey.startsWith("run:")
+            ? delivery.idempotencyKey.slice("run:".length)
+            : (approvalRunId ?? "");
+          let sourceToken = await this.core.acquire(target.accountId, target.accountVersion);
           if (!sourceToken) {
             await this.core.ack(delivery.id);
             return false;
@@ -592,6 +595,21 @@ export class TlonController {
             if (runId && !run) {
               await this.core.ack(delivery.id);
               return false;
+            }
+            if (approvalRunId && run?.scopeVersion) {
+              await this.core.release(target.accountId, target.accountVersion, sourceToken).catch(() => undefined);
+              sourceToken = "";
+              const scopedToken = await this.core.acquire(
+                target.accountId,
+                target.accountVersion,
+                run.conversationId,
+                run.scopeVersion,
+              );
+              if (!scopedToken) {
+                await this.core.ack(delivery.id);
+                return false;
+              }
+              sourceToken = scopedToken;
             }
             if (target.kind === "channel" && runId && run?.scopeVersion !== scopeVersion) {
               await this.core.ack(delivery.id);
@@ -639,7 +657,8 @@ export class TlonController {
             await this.core.releaseDelivery(delivery.id, delivery.claimToken);
             return false;
           } finally {
-            await this.core.release(target.accountId, target.accountVersion, sourceToken).catch(() => undefined);
+            if (sourceToken)
+              await this.core.release(target.accountId, target.accountVersion, sourceToken).catch(() => undefined);
           }
         } catch (error) {
           if (this.abort.signal.aborted) {
