@@ -12,7 +12,8 @@ export interface DeliveryStore {
     shadow?: boolean;
   }): Promise<Delivery>;
   pending(type: string): Promise<Delivery[]>;
-  claimPending(type: string, ttlMs: number): Promise<Delivery[]>;
+  claimPending(type: string, ttlMs: number, limit?: number, grouped?: boolean): Promise<Delivery[]>;
+  releaseClaim(id: string, claimToken: string): Promise<boolean>;
   listShadow(opts?: { limit?: number }): Promise<Delivery[]>;
   ack(id: string, at: number, slackApiMs?: number): Promise<void>;
   ackByKey(idempotencyKey: string, at: number): Promise<void>;
@@ -30,6 +31,7 @@ export function createDeliveryStore(): DeliveryStore {
   const deliveries = new Map<string, Delivery>();
   const byKey = new Map<string, string>();
   const claimedUntil = new Map<string, number>();
+  const claimTokens = new Map<string, string>();
   const enqueueListeners = new Set<() => void>();
 
   return {
@@ -55,14 +57,37 @@ export function createDeliveryStore(): DeliveryStore {
     async pending(type) {
       return [...deliveries.values()].filter((d) => d.deliveredAt === null && !d.shadow && d.destination.type === type);
     },
-    async claimPending(type, ttlMs) {
+    async claimPending(type, ttlMs, limit, grouped) {
       const now = Date.now();
-      const rows = [...deliveries.values()].filter(
-        (d) =>
-          d.deliveredAt === null && !d.shadow && d.destination.type === type && (claimedUntil.get(d.id) ?? 0) <= now,
-      );
-      for (const d of rows) claimedUntil.set(d.id, now + ttlMs);
-      return rows;
+      const rowLimit =
+        typeof limit === "number" && Number.isInteger(limit) && limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
+      const pending = [...deliveries.values()]
+        .filter((d) => d.deliveredAt === null && !d.shadow && d.destination.type === type)
+        .sort((a, b) => a.createdAt - b.createdAt);
+      const candidates = grouped
+        ? [
+            ...pending
+              .reduce((heads, delivery) => {
+                const key = delivery.destination.queueKey ?? "";
+                if (!heads.has(key)) heads.set(key, delivery);
+                return heads;
+              }, new Map<string, Delivery>())
+              .values(),
+          ]
+        : pending;
+      const rows = candidates.filter((d) => (claimedUntil.get(d.id) ?? 0) <= now).slice(0, rowLimit);
+      return rows.map((delivery) => {
+        const claimToken = randomUUID();
+        claimedUntil.set(delivery.id, now + ttlMs);
+        claimTokens.set(delivery.id, claimToken);
+        return { ...delivery, claimToken };
+      });
+    },
+    async releaseClaim(id, claimToken) {
+      if (claimTokens.get(id) !== claimToken) return false;
+      claimTokens.delete(id);
+      claimedUntil.delete(id);
+      return true;
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);
@@ -75,6 +100,8 @@ export function createDeliveryStore(): DeliveryStore {
       const d = deliveries.get(id);
       if (d && d.deliveredAt === null) {
         d.deliveredAt = at;
+        claimTokens.delete(id);
+        claimedUntil.delete(id);
         d.deliverLatencyMs = Math.max(0, at - d.createdAt);
         if (slackApiMs !== undefined) d.slackApiMs = slackApiMs;
       }
@@ -83,7 +110,11 @@ export function createDeliveryStore(): DeliveryStore {
       const existingId = byKey.get(idempotencyKey);
       if (existingId) {
         const d = deliveries.get(existingId);
-        if (d && d.deliveredAt === null) d.deliveredAt = at;
+        if (d && d.deliveredAt === null) {
+          d.deliveredAt = at;
+          claimTokens.delete(existingId);
+          claimedUntil.delete(existingId);
+        }
         return;
       }
       const tombstone: Delivery = {
@@ -109,7 +140,11 @@ export function createDeliveryStore(): DeliveryStore {
       const d = deliveries.get(id);
       if (!d || d.destination.type !== "principal") return;
       d.recipientThreadRef = recipientThreadRef;
-      if (d.deliveredAt === null) d.deliveredAt = at;
+      if (d.deliveredAt === null) {
+        d.deliveredAt = at;
+        claimTokens.delete(id);
+        claimedUntil.delete(id);
+      }
     },
     async listByRecipientThread(recipientThreadRef, opts) {
       const limit = Math.max(1, opts?.limit ?? 20);

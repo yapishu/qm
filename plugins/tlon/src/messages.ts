@@ -16,11 +16,21 @@ function ship(value: unknown): string {
   return (raw.startsWith("~") ? raw : `~${raw}`).toLowerCase();
 }
 
-function essay(value: unknown): { author: string; content: unknown } | null {
+function essay(value: unknown): { author: string; content: unknown; blob?: string } | null {
   const source = record(value);
   if (!source) return null;
   const author = ship(source.author);
-  return author ? { author, content: source.content } : null;
+  return author
+    ? {
+        author,
+        content: source.content,
+        ...(typeof source.blob === "string" && source.blob ? { blob: source.blob } : {}),
+      }
+    : null;
+}
+
+function hasRichPayload(content: { content: unknown; blob?: string }): boolean {
+  return Boolean(content.blob) || (Array.isArray(content.content) && content.content.length > 0);
 }
 
 function allowed(installation: Installation, sender: string): boolean {
@@ -68,7 +78,7 @@ export function parseChannelMessage(
   if (!content || content.author === installation.ship || !allowed(installation, content.author)) return null;
   const rawText = toText(content.content).trim();
   const text = mentionText(installation, rawText);
-  if (text === null || !text) return null;
+  if (text === null || (!text && !hasRichPayload(content))) return null;
   const messageId = String(reply?.id ?? post?.id ?? "");
   if (!messageId) return null;
   const seal = record(replySet?.seal);
@@ -78,10 +88,13 @@ export function parseChannelMessage(
   const threadRoot = replySet ? parent || String(post?.id ?? "") : "";
   return {
     accountId: installation.id,
+    installationVersion: installation.version,
     principalId: installation.principalId,
     messageId,
     senderShip: content.author,
     text,
+    content: content.content,
+    ...(content.blob ? { blob: content.blob } : {}),
     kind: "channel",
     target: nest,
     ...(threadRoot ? { threadRoot } : {}),
@@ -107,16 +120,19 @@ export function parseDmMessage(installation: Installation, value: unknown, toTex
   )
     return null;
   const text = toText(content.content).trim();
-  if (!text) return null;
+  if (!text && !hasRichPayload(content)) return null;
   const messageId = reply ? String(reply.id ?? deltaAdd?.id ?? "") : String(event.id ?? "");
   if (!messageId) return null;
   const parent = reply ? writ(event.id, partner) : null;
   return {
     accountId: installation.id,
+    installationVersion: installation.version,
     principalId: installation.principalId,
     messageId,
     senderShip: partner,
     text,
+    content: content.content,
+    ...(content.blob ? { blob: content.blob } : {}),
     kind: "dm",
     target: partner,
     ...(parent?.id ? { threadRoot: parent.id, parentAuthor: parent.author } : {}),

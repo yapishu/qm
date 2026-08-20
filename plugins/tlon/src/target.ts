@@ -15,6 +15,7 @@ export function decodeDeliveryTarget(value: string): DeliveryTarget {
   }
   return {
     accountId: parsed.accountId,
+    ...(typeof parsed.accountVersion === "string" ? { accountVersion: parsed.accountVersion } : {}),
     kind: parsed.kind,
     target: parsed.target,
     ...(typeof parsed.replyTo === "string" ? { replyTo: parsed.replyTo } : {}),

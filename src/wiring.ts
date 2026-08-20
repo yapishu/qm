@@ -485,6 +485,7 @@ export function buildApp(
     config.orgId,
     artifactMap("tlon_installations"),
     config.connectorSecretKey ?? randomBytes(32),
+    artifactMap("tlon_inbound"),
   );
   const deploymentLayer = config.deploymentLayerDir
     ? loadDeploymentLayer(config.deploymentLayerDir)

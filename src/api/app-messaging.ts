@@ -44,6 +44,7 @@ export function createMessagingMethods(
   | "setWebhookEnabled"
   | "setWebhookRecipientConsent"
   | "pendingDeliveries"
+  | "releaseDeliveryClaim"
   | "enqueueDelivery"
   | "ingestSurfaceEvents"
   | "searchSurface"
@@ -224,8 +225,13 @@ export function createMessagingMethods(
     setWebhookRecipientConsent(id, recipientConsent) {
       return deps.webhooks.setRecipientConsent(id, recipientConsent);
     },
-    pendingDeliveries(type, claimMs) {
-      return claimMs && claimMs > 0 ? deps.deliveries.claimPending(type, claimMs) : deps.deliveries.pending(type);
+    pendingDeliveries(type, claimMs, limit, grouped) {
+      return claimMs && claimMs > 0
+        ? deps.deliveries.claimPending(type, claimMs, limit, grouped)
+        : deps.deliveries.pending(type);
+    },
+    releaseDeliveryClaim(id, claimToken) {
+      return deps.deliveries.releaseClaim(id, claimToken);
     },
     async enqueueDelivery(input) {
       await deps.deliveries.enqueue(input);

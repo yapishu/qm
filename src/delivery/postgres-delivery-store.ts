@@ -18,6 +18,7 @@ function rowToDelivery(r: Record<string, unknown>): Delivery {
     ...(r.recipient_thread_ref != null ? { recipientThreadRef: r.recipient_thread_ref as string } : {}),
     ...(r.deliver_latency_ms != null ? { deliverLatencyMs: Number(r.deliver_latency_ms) } : {}),
     ...(r.slack_api_ms != null ? { slackApiMs: Number(r.slack_api_ms) } : {}),
+    ...(r.claim_token != null ? { claimToken: r.claim_token as string } : {}),
   };
 }
 
@@ -40,6 +41,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS deliver_latency_ms INT`,
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS slack_api_ms INT`,
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS claim_expires_at BIGINT`,
+    `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS claim_token TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_deliveries_recipient_thread
         ON deliveries (recipient_thread_ref, created_at) WHERE recipient_thread_ref IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_deliveries_shadow
@@ -85,22 +87,67 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
       );
       return rows.map(rowToDelivery);
     },
-    async claimPending(type, ttlMs) {
+    async claimPending(type, ttlMs, limit, grouped) {
+      const rowLimit = typeof limit === "number" && Number.isInteger(limit) && limit > 0 ? limit : 2_147_483_647;
+      const claimToken = randomUUID();
+      if (grouped) {
+        const rows = await q(
+          `WITH ranked AS (
+             SELECT id,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY COALESCE(destination->>'queueKey', '')
+                      ORDER BY created_at, id
+                    ) AS position
+               FROM deliveries
+              WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1
+           ), candidates AS (
+             SELECT deliveries.id
+               FROM deliveries
+               JOIN ranked USING (id)
+              WHERE ranked.position = 1
+                AND (claim_expires_at IS NULL
+                  OR claim_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+              ORDER BY created_at, id
+              LIMIT $3
+              FOR UPDATE OF deliveries SKIP LOCKED
+           )
+           UPDATE deliveries
+              SET claim_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2,
+                  claim_token = $4
+            WHERE id IN (SELECT id FROM candidates)
+            RETURNING *`,
+          [type, ttlMs, rowLimit, claimToken],
+        );
+        return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+      }
       const rows = await q(
         `UPDATE deliveries
-            SET claim_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2
+            SET claim_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2,
+                claim_token = $4
           WHERE id IN (
             SELECT id FROM deliveries
              WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1
                AND (claim_expires_at IS NULL
                  OR claim_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
              ORDER BY created_at
+             LIMIT $3
                FOR UPDATE SKIP LOCKED
           )
           RETURNING *`,
-        [type, ttlMs],
+        [type, ttlMs, rowLimit, claimToken],
       );
       return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+    },
+    async releaseClaim(id, claimToken) {
+      const rows = await q(
+        `UPDATE deliveries
+            SET claim_expires_at = NULL,
+                claim_token = NULL
+          WHERE id = $1 AND delivered_at IS NULL AND claim_token = $2
+          RETURNING id`,
+        [id, claimToken],
+      );
+      return rows.length > 0;
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);
@@ -115,7 +162,9 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
         `UPDATE deliveries
             SET delivered_at = $2,
                 deliver_latency_ms = GREATEST(0, $2 - created_at),
-                slack_api_ms = COALESCE($3, slack_api_ms)
+                slack_api_ms = COALESCE($3, slack_api_ms),
+                claim_expires_at = NULL,
+                claim_token = NULL
           WHERE id = $1 AND delivered_at IS NULL`,
         [id, at, slackApiMs ?? null],
       );
@@ -125,7 +174,9 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
         `INSERT INTO deliveries (id, idempotency_key, destination, text, created_at, delivered_at)
          VALUES ($1, $2, '{"type":"ack-tombstone","target":""}', '', $3, $3)
          ON CONFLICT (idempotency_key)
-         DO UPDATE SET delivered_at = COALESCE(deliveries.delivered_at, EXCLUDED.delivered_at)`,
+         DO UPDATE SET delivered_at = COALESCE(deliveries.delivered_at, EXCLUDED.delivered_at),
+                       claim_expires_at = NULL,
+                       claim_token = NULL`,
         [randomUUID(), idempotencyKey, at],
       );
     },
@@ -144,7 +195,9 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
       await query(
         `UPDATE deliveries
             SET recipient_thread_ref = $2,
-                delivered_at = COALESCE(delivered_at, $3)
+                delivered_at = COALESCE(delivered_at, $3),
+                claim_expires_at = NULL,
+                claim_token = NULL
           WHERE id = $1 AND destination->>'type' = 'principal'`,
         [id, recipientThreadRef, at],
       );

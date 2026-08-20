@@ -164,6 +164,7 @@ export interface TriggerBase {
 export interface Destination {
   type: string;
   target: string;
+  queueKey?: string;
   audienceScopeId?: ScopeId;
   onBehalfOf?: string;
   editRef?: string;
@@ -273,6 +274,7 @@ export interface Delivery {
   recipientThreadRef?: string;
   deliverLatencyMs?: number;
   slackApiMs?: number;
+  claimToken?: string;
 }
 
 export interface SurfaceContextQuery {
@@ -390,6 +392,7 @@ export interface TurnRequest {
   surface: string;
   scopeVersion?: string;
   deliveryTarget?: string;
+  deliveryQueueKey?: string;
   deliveryCandidates?: { target: string; label: string }[];
   actor: ActorAssertion;
   conversation: {

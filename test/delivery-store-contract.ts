@@ -236,4 +236,69 @@ export async function exerciseDeliveryStore(store: DeliveryStore): Promise<void>
     "an expired claim re-surfaces (at-least-once)",
   );
   await store.ack(abandoned.id, 700);
+
+  const boundedA = await store.enqueue({
+    destination: { type: "group", target: "C-bounded" },
+    text: "first bounded delivery",
+    idempotencyKey: "bounded-1",
+  });
+  const boundedB = await store.enqueue({
+    destination: { type: "group", target: "C-bounded" },
+    text: "second bounded delivery",
+    idempotencyKey: "bounded-2",
+  });
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1)).map((delivery) => delivery.id),
+    [boundedA.id],
+  );
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1)).map((delivery) => delivery.id),
+    [boundedB.id],
+  );
+  await store.ack(boundedA.id, 800);
+  await store.ack(boundedB.id, 800);
+
+  const orderedA = await store.enqueue({
+    destination: { type: "group", target: "C-ordered", queueKey: "account-a" },
+    text: "first ordered delivery",
+    idempotencyKey: "ordered-1",
+  });
+  const orderedB = await store.enqueue({
+    destination: { type: "group", target: "C-ordered", queueKey: "account-a" },
+    text: "second ordered delivery",
+    idempotencyKey: "ordered-2",
+  });
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1, true)).map((delivery) => delivery.id),
+    [orderedA.id],
+  );
+  assert.deepEqual(await store.claimPending("group", 60_000, 1, true), []);
+  const groupedHealthy = await store.enqueue({
+    destination: { type: "group", target: "C-healthy", queueKey: "account-b" },
+    text: "another account remains independent",
+    idempotencyKey: "ordered-healthy",
+  });
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1, true)).map((delivery) => delivery.id),
+    [groupedHealthy.id],
+  );
+  await store.ack(groupedHealthy.id, 900);
+  await store.ack(orderedA.id, 900);
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1, true)).map((delivery) => delivery.id),
+    [orderedB.id],
+  );
+  await store.ack(orderedB.id, 900);
+
+  const releasable = await store.enqueue({
+    destination: { type: "group", target: "C-release", queueKey: "account-release" },
+    text: "release this claim",
+    idempotencyKey: "release-claim",
+  });
+  const [claimed] = await store.claimPending("group", 60_000, 1, true);
+  assert.equal(claimed?.id, releasable.id);
+  assert.equal(await store.releaseClaim(releasable.id, "wrong-token"), false);
+  assert.equal(await store.releaseClaim(releasable.id, claimed!.claimToken!), true);
+  assert.equal((await store.claimPending("group", 60_000, 1, true))[0]?.id, releasable.id);
+  await store.ack(releasable.id, 1000);
 }

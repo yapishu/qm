@@ -46,10 +46,12 @@ test("channel messages are principal-bound, owner-only, mention-gated, and threa
   );
   assert.deepEqual(message, {
     accountId: "support",
+    installationVersion: "1",
     principalId: "alice@example.com",
     messageId: "reply-1",
     senderShip: "~zod",
     text: "please help",
+    content: "~sampel-palnet please help",
     kind: "channel",
     target: "chat/~zod/General",
     threadRoot: "root-1",
@@ -81,10 +83,12 @@ test("channel messages are principal-bound, owner-only, mention-gated, and threa
     ),
     {
       accountId: "support",
+      installationVersion: "1",
       principalId: "alice@example.com",
       messageId: "top-level-1",
       senderShip: "~zod",
       text: "top level",
+      content: "~sampel-palnet top level",
       kind: "channel",
       target: "chat/~zod/General",
     },
@@ -103,10 +107,12 @@ test("DM messages route through the user's account and accept only its owner shi
   );
   assert.deepEqual(message, {
     accountId: "support",
+    installationVersion: "1",
     principalId: "alice@example.com",
     messageId: "dm-root",
     senderShip: "~zod",
     text: "hello",
+    content: "hello",
     kind: "dm",
     target: "~zod",
   });
@@ -127,10 +133,12 @@ test("DM messages route through the user's account and accept only its owner shi
     ),
     {
       accountId: "support",
+      installationVersion: "1",
       principalId: "alice@example.com",
       messageId: "dm-reply",
       senderShip: "~zod",
       text: "inside thread",
+      content: "inside thread",
       kind: "dm",
       target: "~zod",
       threadRoot: "dm-root",
@@ -149,6 +157,33 @@ test("DM messages route through the user's account and accept only its owner shi
       text,
     ),
     null,
+  );
+});
+
+test("message parsers preserve Story and blob data for connector-side enrichment", () => {
+  const content = [{ block: { image: { src: "https://cdn.example.com/photo.png", alt: "photo.png" } } }];
+  assert.deepEqual(
+    parseDmMessage(
+      installation,
+      {
+        whom: "~zod",
+        id: "media-only",
+        response: { add: { essay: { author: "~zod", content, blob: '[{"type":"file"}]' } } },
+      },
+      () => "",
+    ),
+    {
+      accountId: "support",
+      installationVersion: "1",
+      principalId: "alice@example.com",
+      messageId: "media-only",
+      senderShip: "~zod",
+      text: "",
+      content,
+      blob: '[{"type":"file"}]',
+      kind: "dm",
+      target: "~zod",
+    },
   );
 });
 

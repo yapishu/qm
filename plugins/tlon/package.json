@@ -12,6 +12,8 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1114.0",
+    "@aws-sdk/s3-request-presigner": "3.1114.0",
     "@tloncorp/api": "0.0.12",
     "ipaddr.js": "2.4.0",
     "mdast-util-to-markdown": "^2.1.2",

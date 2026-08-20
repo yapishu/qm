@@ -1,6 +1,6 @@
 import type { TurnOrigin, TurnRequest } from "../../types.ts";
 import { resolveTurnOrigin } from "../../core/turn-origin.ts";
-import { sendJson } from "../http.ts";
+import { contentDispositionAttachment, pipeToResponse, sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
 import { type ApiCtx, type Route } from "./route.ts";
 
@@ -119,7 +119,34 @@ async function listDeliveries(ctx: ApiCtx): Promise<void> {
   const type = url.searchParams.get("type") ?? "";
   const claimMsRaw = Number(url.searchParams.get("claimMs") ?? 0);
   const claimMs = Number.isFinite(claimMsRaw) && claimMsRaw > 0 ? claimMsRaw : 0;
-  return sendJson(res, 200, { deliveries: await app.pendingDeliveries(type, claimMs) });
+  const limitRaw = Number(url.searchParams.get("limit") ?? 0);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(100, limitRaw) : undefined;
+  const grouped = url.searchParams.get("grouped") === "1";
+  return sendJson(res, 200, { deliveries: await app.pendingDeliveries(type, claimMs, limit, grouped) });
+}
+
+async function getDeliveryAttachment(ctx: ApiCtx): Promise<void> {
+  const { res, app, deps } = ctx;
+  const id = ctx.params.id!;
+  const rawIndex = ctx.params.index!;
+  if (!deps.deliveries) return sendJson(res, 501, { error: "not_configured" });
+  if (!/^(0|[1-9][0-9]*)$/.test(rawIndex)) return sendJson(res, 404, { error: "not_found" });
+  const delivery = await deps.deliveries.get(id);
+  const attachment = delivery?.attachments?.[Number(rawIndex)];
+  if (!delivery || delivery.destination.type !== "tlon" || !attachment) {
+    return sendJson(res, 404, { error: "not_found" });
+  }
+  let opened = await deps.blobTransfer?.open(attachment.blobId);
+  if (!opened && attachment.artifactId && attachment.artifactViewerId) {
+    opened = (await app.openFileForViewer(attachment.artifactId, attachment.artifactViewerId)) ?? undefined;
+  }
+  if (!opened) return sendJson(res, 404, { error: "not_found" });
+  res.writeHead(200, {
+    "content-type": attachment.mimetype || "application/octet-stream",
+    "content-length": String(opened.sizeBytes),
+    "content-disposition": contentDispositionAttachment(attachment.name),
+  });
+  pipeToResponse(res, opened.stream, "delivery attachment read failed");
 }
 
 async function ackDelivery(ctx: ApiCtx): Promise<void> {
@@ -134,6 +161,13 @@ async function ackDelivery(ctx: ApiCtx): Promise<void> {
   if (recipientThreadRef) await app.recordPrincipalDelivery(id, recipientThreadRef);
   await app.ackDelivery(id, slackApiMs);
   return sendJson(res, 200, { ok: true });
+}
+
+async function releaseDelivery(ctx: ApiCtx): Promise<void> {
+  const claimToken = isObj(ctx.body) && typeof ctx.body.claimToken === "string" ? ctx.body.claimToken : "";
+  if (!claimToken) return sendJson(ctx.res, 400, { error: "bad_request" });
+  const released = await ctx.app.releaseDeliveryClaim(ctx.params.id ?? "", claimToken);
+  return released ? sendJson(ctx.res, 200, { ok: true }) : sendJson(ctx.res, 404, { error: "not_found" });
 }
 
 async function ackDeliveryByKey(ctx: ApiCtx): Promise<void> {
@@ -174,6 +208,8 @@ export const turnRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/runs/:id", auth: "source", handle: getRun },
   { method: "GET", path: "/v1/runs", auth: "source", handle: getActiveRunForThread },
   { method: "GET", path: "/v1/deliveries", auth: "source", handle: listDeliveries },
+  { method: "GET", path: "/v1/deliveries/:id/attachments/:index", auth: "source", handle: getDeliveryAttachment },
   { method: "POST", path: "/v1/deliveries/:id/ack", auth: "source", handle: ackDelivery },
+  { method: "POST", path: "/v1/deliveries/:id/release", auth: "source", handle: releaseDelivery },
   { method: "POST", path: "/v1/deliveries/ack-by-key", auth: "source", handle: ackDeliveryByKey },
 ];

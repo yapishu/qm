@@ -21,6 +21,7 @@ export function runResultDelivery(run: Run, taskList: Task[] = []): RunResultDel
   const destination: Destination = {
     type: surface,
     target,
+    ...(run.request.deliveryQueueKey ? { queueKey: run.request.deliveryQueueKey } : {}),
     ...(editRef ? { editRef } : {}),
     ...(taskList.length ? { taskList: taskList.map(({ id, title, status }) => ({ id, title, status })) } : {}),
   };

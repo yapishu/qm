@@ -191,21 +191,32 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
   try {
     const alice = userHeaders("alice@example.com");
     const bob = userHeaders("bob@example.com");
+    const connectionInput = {
+      ship: "~sampel-palnet",
+      url: "https://support.example.com",
+      code: "lidlut-tabwed-pillex-ridrup",
+      ownerShip: "~zod",
+      channels: ["chat/~sampel-palnet/general"],
+    };
     const create = await fetch(`${srv.base}/v1/tlon/connections`, {
       method: "POST",
       headers: alice,
-      body: JSON.stringify({
-        ship: "~sampel-palnet",
-        url: "https://support.example.com",
-        code: "lidlut-tabwed-pillex-ridrup",
-        ownerShip: "~zod",
-        channels: ["chat/~sampel-palnet/general"],
-      }),
+      body: JSON.stringify(connectionInput),
     });
     const createText = await create.text();
     assert.equal(create.status, 201, createText);
     const created = JSON.parse(createText) as { connection: { id: string } };
     const id = created.connection.id;
+    assert.equal(
+      (
+        await fetch(`${srv.base}/v1/tlon/connections`, {
+          method: "POST",
+          headers: alice,
+          body: JSON.stringify(connectionInput),
+        })
+      ).status,
+      400,
+    );
 
     const response = await fetch(`${srv.base}/v1/tlon/connections`, { headers: alice });
     assert.equal(response.status, 200);
@@ -241,6 +252,27 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
     assert.equal(runtime[0]?.code, "lidlut-tabwed-pillex-ridrup");
     assert.equal(runtime[0]?.principalId, "alice@example.com");
     const oldVersion = runtime[0]!.version;
+    const lease = await fetch(`${srv.base}/v1/tlon/installations/${id}/lease`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ version: oldVersion }),
+    });
+    const leaseBody = (await lease.json()) as { token: string };
+    assert.equal(lease.status, 200);
+    assert.equal(
+      (await fetch(`${srv.base}/v1/tlon/connections/${id}`, { method: "DELETE", headers: alice })).status,
+      409,
+    );
+    assert.equal(
+      (
+        await fetch(`${srv.base}/v1/tlon/installations/${id}/release`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ version: oldVersion, token: leaseBody.token }),
+        })
+      ).status,
+      200,
+    );
     const sourceResponse = await fetch(`${srv.base}/v1/tlon/installations`);
     assert.equal(sourceResponse.status, 200);
     const sourceRecords = (await sourceResponse.json()) as {
@@ -255,9 +287,75 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
     assert.equal(statusReport.status, 200, await statusReport.text());
     assert.equal((await srv.built.tlonInstallations.list("alice@example.com"))[0]?.runtimeStatus, "connected");
 
+    const inboundMessage = {
+      accountId: id,
+      installationVersion: oldVersion,
+      principalId: "alice@example.com",
+      messageId: "ship-event-1",
+      senderShip: "~zod",
+      text: "look at this",
+      content: [{ inline: ["look at this"] }],
+      kind: "dm",
+      target: "~zod",
+    };
+    const enqueue = async (body: object) =>
+      await fetch(`${srv.base}/v1/tlon/inbound`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const firstReceipt = (await (await enqueue({ message: inboundMessage })).json()) as { id: string };
+    const duplicateReceipt = (await (await enqueue({ message: inboundMessage })).json()) as { id: string };
+    assert.equal(duplicateReceipt.id, firstReceipt.id);
+    const secondMessage = { ...inboundMessage, messageId: "ship-event-2" };
+    const secondReceipt = (await (await enqueue({ message: secondMessage, previousId: firstReceipt.id })).json()) as {
+      id: string;
+    };
+    assert.equal((await enqueue({ message: { ...inboundMessage, principalId: "bob@example.com" } })).status, 404);
+    const claimed = (await (await fetch(`${srv.base}/v1/tlon/inbound?claimMs=60000`)).json()) as {
+      records: Array<{ id: string; claimToken: string; message: typeof inboundMessage }>;
+    };
+    assert.equal(claimed.records.length, 1);
+    assert.deepEqual(claimed.records[0]?.message, inboundMessage);
+    assert.equal(
+      (
+        await fetch(`${srv.base}/v1/tlon/inbound/${encodeURIComponent(firstReceipt.id)}/ack`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ claimToken: "wrong-lease" }),
+        })
+      ).status,
+      404,
+    );
+    assert.equal(
+      (
+        await fetch(`${srv.base}/v1/tlon/inbound/${encodeURIComponent(firstReceipt.id)}/ack`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ claimToken: claimed.records[0]!.claimToken }),
+        })
+      ).status,
+      200,
+    );
+    const secondClaim = (await (await fetch(`${srv.base}/v1/tlon/inbound?claimMs=60000`)).json()) as {
+      records: Array<{ id: string; claimToken: string; message: typeof secondMessage }>;
+    };
+    assert.equal(secondClaim.records[0]?.id, secondReceipt.id);
+    assert.equal(
+      (
+        await fetch(`${srv.base}/v1/tlon/inbound/${encodeURIComponent(secondReceipt.id)}/ack`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ claimToken: secondClaim.records[0]!.claimToken }),
+        })
+      ).status,
+      200,
+    );
+    assert.deepEqual(await (await fetch(`${srv.base}/v1/tlon/inbound?claimMs=60000`)).json(), { records: [] });
+
     const queued = await srv.built.app.turn({
       surface: "tlon",
-      deliveryTarget: encodeDeliveryTarget({ accountId: id, kind: "dm", target: "~zod" }),
+      deliveryTarget: encodeDeliveryTarget({ accountId: id, accountVersion: oldVersion, kind: "dm", target: "~zod" }),
       actor: { externalId: "alice@example.com", displayName: "~zod" },
       conversation: { kind: "dm", threadRef: `tlon:${id}:dm:~zod`, isPrivate: true },
       text: "check this",
@@ -287,6 +385,7 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
         {
           runId: queued.runId,
           accountId: id,
+          accountVersion: oldVersion,
           conversationId: "~zod",
           status: "pending",
           activeTools: ["tool"],
@@ -297,6 +396,7 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
     assert.deepEqual(await (await fetch(`${srv.base}/v1/tlon/presence/runs/${id}/${queued.runId}`)).json(), {
       runId: queued.runId,
       accountId: id,
+      accountVersion: oldVersion,
       conversationId: "~zod",
       status: "pending",
       activeTools: ["tool"],
@@ -340,9 +440,27 @@ test("signed-in users manage only their own encrypted Tlon connections", async (
       (await fetch(`${srv.base}/v1/tlon/connections/${id}`, { method: "DELETE", headers: bob })).status,
       404,
     );
+    assert.equal(
+      (await enqueue({ message: { ...inboundMessage, messageId: "stale-event-before-delete" } })).status,
+      404,
+    );
+    const currentVersion = (await srv.built.tlonInstallations.runtime())[0]!.version;
+    assert.equal(
+      (
+        await enqueue({
+          message: {
+            ...inboundMessage,
+            installationVersion: currentVersion,
+            messageId: "ship-event-before-delete",
+          },
+        })
+      ).status,
+      202,
+    );
     const del = await fetch(`${srv.base}/v1/tlon/connections/${id}`, { method: "DELETE", headers: alice });
     assert.equal(del.status, 200);
     assert.deepEqual(await srv.built.tlonInstallations.list("alice@example.com"), []);
+    assert.deepEqual(await (await fetch(`${srv.base}/v1/tlon/inbound?claimMs=60000`)).json(), { records: [] });
   } finally {
     await srv.close();
   }

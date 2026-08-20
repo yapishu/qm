@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
+  appendFileUploadToPostBlob,
+  appendVideoToPostBlob,
   clearConversationPresence,
   createComputingStatus,
   getTextContent,
@@ -15,14 +17,30 @@ import {
 } from "@tloncorp/api";
 import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { parseChannelMessage, parseDmMessage, dmInvites } from "./messages.ts";
+import {
+  citedPost,
+  citeReferences,
+  downloadMedia,
+  MAX_TLON_ATTACHMENT_BYTES,
+  MAX_TLON_ATTACHMENTS,
+  mediaReferences,
+  publicMediaUrl,
+  safeMediaName,
+  type CiteReference,
+  type DownloadedMedia,
+  type MediaReference,
+} from "./attachments.ts";
 import { createPinnedOriginFetch, type PinnedOriginFetch } from "./network.ts";
-import type { Delivery, Installation } from "./types.ts";
+import type { Delivery, InboundMessage, Installation, OutgoingAttachment } from "./types.ts";
 import { decodeDeliveryTarget } from "./target.ts";
 import { markdownToStory } from "./story.ts";
+import { uploadTlonAttachment } from "./upload.ts";
 
 const apiClient = new AsyncLocalStorage<Urbit>();
 const PRESENCE_TIMEOUT = "~m1.s30";
 const PRESENCE_TOOLS = new Set(["exec", "read", "web_fetch"]);
+const MAX_CITED_TEXT = 4_000;
+const MAX_INBOUND_RECEIPTS = 20;
 
 setClientResolver(() => apiClient.getStore() ?? null);
 
@@ -38,6 +56,24 @@ async function withinCleanup(promise: Promise<unknown>, ms: number): Promise<voi
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function withSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  return new Promise<T>((resolve, reject) => {
+    const aborted = (): void => reject(signal.reason);
+    signal.addEventListener("abort", aborted, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
 }
 
 export function originLockedFetch(baseUrl: string, fetchImpl: typeof fetch = fetch): typeof fetch {
@@ -62,6 +98,7 @@ export async function authenticateShip(
   ship: string,
   code: string,
   fetchImpl: typeof fetch = fetch,
+  operationSignal?: () => AbortSignal | null,
 ): Promise<typeof fetch> {
   const origin = new URL(baseUrl).origin;
   const lockedFetch = originLockedFetch(origin, fetchImpl);
@@ -82,7 +119,10 @@ export async function authenticateShip(
   return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const headers = requestHeaders(input, init);
     headers.set("cookie", cookie);
-    return lockedFetch(input, { ...init, headers });
+    const activeSignal = operationSignal?.();
+    const signal =
+      activeSignal && init?.signal ? AbortSignal.any([activeSignal, init.signal]) : (activeSignal ?? init?.signal);
+    return lockedFetch(input, { ...init, headers, ...(signal ? { signal } : {}) });
   }) as typeof fetch;
 }
 
@@ -108,45 +148,278 @@ export class TlonConnection {
   private stopped = false;
   private state: { status: "connecting" | "connected" | "error"; message?: string } = { status: "connecting" };
   private readonly seen = new Set<string>();
-  private readonly inbound: (message: ReturnType<typeof parseChannelMessage>) => Promise<void>;
+  private readonly inbound: (
+    message: InboundMessage | null,
+    previousId?: string,
+    signal?: AbortSignal,
+  ) => Promise<string | void>;
+  private readonly inboundReceipts = new Set<Promise<void>>();
+  private inboundTail: Promise<void> = Promise.resolve();
+  private previousInboundId: string | undefined;
+  private inboundFailed = false;
+  private inboundFailureMessage = "durable inbound handoff failed";
+  private pendingAckId = -1;
+  private ackTask: Promise<void> | null = null;
   private readonly createTransport: (baseUrl: string) => Promise<PinnedOriginFetch>;
   private readonly createClient: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
+  private readonly stageBlob?: (
+    bytes: Uint8Array,
+    signal?: AbortSignal,
+  ) => Promise<{ blobId: string; sizeBytes: number }>;
+  private readonly readAttachment?: (deliveryId: string, index: number, signal?: AbortSignal) => Promise<Uint8Array>;
+  private readonly downloadAttachment: (
+    media: MediaReference,
+    maxBytes?: number,
+    signal?: AbortSignal,
+  ) => Promise<DownloadedMedia>;
+  private readonly uploadAttachment: (
+    attachment: OutgoingAttachment,
+    bytes: Uint8Array,
+    deliveryId: string,
+    index: number,
+    signal: AbortSignal,
+  ) => Promise<{ url: string }>;
+  private readonly resolveCite: (
+    cite: CiteReference,
+    signal?: AbortSignal,
+  ) => Promise<{ author: string; text: string } | null>;
+  private readonly validateUploadUrl: (url: string) => Promise<string>;
   private readonly cleanupTimeoutMs: number;
+  private readonly operationTimeoutMs: number;
   private readonly presenceContexts = new Set<string>();
+  private readonly operationAbort = new AbortController();
+  private activeOperationSignal: AbortSignal | null = null;
 
   constructor(
     installation: Installation,
-    inbound: (message: NonNullable<ReturnType<typeof parseChannelMessage>>) => Promise<void>,
+    inbound: (
+      message: NonNullable<ReturnType<typeof parseChannelMessage>>,
+      previousId?: string,
+      signal?: AbortSignal,
+    ) => Promise<string | void>,
     deps: {
       createTransport?: (baseUrl: string) => Promise<PinnedOriginFetch>;
       createClient?: (baseUrl: string, fetchImpl: typeof fetch) => Urbit;
+      stageBlob?: (bytes: Uint8Array, signal?: AbortSignal) => Promise<{ blobId: string; sizeBytes: number }>;
+      readAttachment?: (deliveryId: string, index: number, signal?: AbortSignal) => Promise<Uint8Array>;
+      downloadAttachment?: (media: MediaReference, maxBytes?: number, signal?: AbortSignal) => Promise<DownloadedMedia>;
+      uploadAttachment?: (
+        attachment: OutgoingAttachment,
+        bytes: Uint8Array,
+        deliveryId: string,
+        index: number,
+        signal: AbortSignal,
+      ) => Promise<{ url: string }>;
+      resolveCite?: (cite: CiteReference, signal?: AbortSignal) => Promise<{ author: string; text: string } | null>;
+      validateUploadUrl?: (url: string) => Promise<string>;
       cleanupTimeoutMs?: number;
+      operationTimeoutMs?: number;
     } = {},
   ) {
     this.installation = installation;
     this.createTransport = deps.createTransport ?? createPinnedOriginFetch;
     this.createClient =
       deps.createClient ?? ((baseUrl, fetchImpl) => new Urbit(baseUrl, undefined, undefined, fetchImpl));
+    this.stageBlob = deps.stageBlob;
+    this.readAttachment = deps.readAttachment;
+    this.downloadAttachment =
+      deps.downloadAttachment ??
+      ((media, maxBytes, signal) => downloadMedia(media, maxBytes, createPinnedOriginFetch, signal));
+    this.uploadAttachment =
+      deps.uploadAttachment ??
+      ((attachment, bytes, deliveryId, index, signal) => {
+        const client = this.client;
+        if (!client) throw new Error(`Tlon account ${this.installation.id} is not connected`);
+        return uploadTlonAttachment({
+          installation: this.installation,
+          client,
+          attachment,
+          bytes,
+          deliveryId,
+          index,
+          signal,
+        });
+      });
+    this.resolveCite =
+      deps.resolveCite ??
+      (async (cite, signal) => {
+        const client = this.client;
+        if (!client) return null;
+        if (client.nodeId !== this.installation.ship) throw new Error("Tlon API client belongs to another ship");
+        const host = cite.channelId.split("/")[1];
+        if (!host) return null;
+        const path = `/v5/said/${host}/${cite.channelId}/post/${cite.postId}${cite.replyId ? `/${cite.replyId}` : ""}`;
+        const raw = await withSignal(
+          client.subscribeOnce("channels", path, undefined, 3_000),
+          signal ?? AbortSignal.timeout(3_100),
+        );
+        const post = citedPost(raw);
+        const text = (post ? getTextContent(post.content as Story) : "").trim();
+        return post && text ? { author: post.author, text } : null;
+      });
+    this.validateUploadUrl = deps.validateUploadUrl ?? (deps.uploadAttachment ? publicMediaUrl : async (url) => url);
     this.cleanupTimeoutMs = deps.cleanupTimeoutMs ?? 1_000;
-    this.inbound = async (message) => {
-      if (!message || this.seen.has(message.messageId)) return;
+    this.operationTimeoutMs = deps.operationTimeoutMs ?? 30_000;
+    this.inbound = async (message, previousId, signal) => {
+      if (!message || this.stopped || this.seen.has(message.messageId)) return;
       this.seen.add(message.messageId);
       if (this.seen.size > 5000) this.seen.delete(this.seen.values().next().value!);
       try {
-        await inbound(message);
+        return await inbound(message, previousId, signal);
       } catch (error) {
         this.seen.delete(message.messageId);
+        this.inboundFailed = true;
+        this.inboundFailureMessage = "durable inbound handoff failed";
+        if (!this.stopped) this.state = { status: "error", message: this.inboundFailureMessage };
         console.error(
           `[tlon] inbound ${this.installation.id}/${message.messageId} failed:`,
           error instanceof Error ? error.message : String(error),
         );
+        throw error;
       }
+    };
+  }
+
+  private async citedText(message: InboundMessage, signal: AbortSignal): Promise<{ text: string; notes: string[] }> {
+    const resolved = await Promise.all(
+      citeReferences(message.content).map(async (cite) => {
+        try {
+          const post = await this.resolveCite(cite, signal);
+          if (!post) return { text: "", failed: false };
+          const quoted = post.text.slice(0, MAX_CITED_TEXT).replace(/\n/g, "\n> ");
+          return { text: `Quoted Tlon message from ${post.author}:\n> ${quoted}`, failed: false };
+        } catch (error) {
+          if (this.operationAbort.signal.aborted) throw error;
+          return { text: "", failed: true };
+        }
+      }),
+    );
+    return {
+      text: resolved
+        .map((entry) => entry.text)
+        .filter(Boolean)
+        .join("\n\n"),
+      notes: resolved.some((entry) => entry.failed) ? ["A cited Tlon message could not be loaded."] : [],
+    };
+  }
+
+  private async inboundAttachments(
+    message: InboundMessage,
+    signal: AbortSignal,
+  ): Promise<{
+    attachments: NonNullable<InboundMessage["attachments"]>;
+    notes: string[];
+  }> {
+    const sources = mediaReferences(message.content, message.blob);
+    const attachments: NonNullable<InboundMessage["attachments"]> = [];
+    const notes: string[] = [];
+    if (!this.stageBlob && sources.length) return { attachments, notes: ["Tlon media transfer is not configured."] };
+    let remaining = MAX_TLON_ATTACHMENT_BYTES;
+    if (sources.length > MAX_TLON_ATTACHMENTS)
+      notes.push(`Only the first ${MAX_TLON_ATTACHMENTS} Tlon attachments were accepted.`);
+    for (const [index, source] of sources.slice(0, MAX_TLON_ATTACHMENTS).entries()) {
+      try {
+        const media = await withSignal(this.downloadAttachment(source, remaining, signal), signal);
+        const staged = await withSignal(this.stageBlob!(media.bytes, signal), signal);
+        if (staged.sizeBytes !== media.bytes.byteLength) throw new Error("staged media size mismatch");
+        remaining -= staged.sizeBytes;
+        attachments.push({
+          name: media.name,
+          mimetype: media.mimetype,
+          sizeBytes: staged.sizeBytes,
+          blobId: staged.blobId,
+          sourceId: `tlon:${message.messageId}:${index}`,
+          author: message.senderShip,
+        });
+      } catch (error) {
+        if (this.operationAbort.signal.aborted) throw error;
+        notes.push(`${safeMediaName(source.name)} could not be downloaded from Tlon.`);
+      }
+      if (remaining <= 0) break;
+    }
+    return { attachments, notes };
+  }
+
+  async enrichInbound(message: InboundMessage, signal?: AbortSignal): Promise<InboundMessage> {
+    const operationSignal = signal ? AbortSignal.any([signal, this.operationAbort.signal]) : this.operationAbort.signal;
+    const [citation, media] = await Promise.all([
+      this.citedText(message, operationSignal),
+      this.inboundAttachments(message, operationSignal),
+    ]);
+    const text = [message.text, citation.text].filter(Boolean).join("\n\n");
+    const notes = [...citation.notes, ...media.notes];
+    return {
+      ...message,
+      text,
+      ...(media.attachments.length ? { attachments: media.attachments } : {}),
+      ...(notes.length ? { inboundNotes: notes } : {}),
+    };
+  }
+
+  private trackInbound(message: InboundMessage): void {
+    if (this.inboundFailed || this.inboundReceipts.size >= MAX_INBOUND_RECEIPTS) {
+      this.inboundFailed = true;
+      this.inboundFailureMessage = "durable inbound handoff is overloaded";
+      if (!this.stopped) this.state = { status: "error", message: this.inboundFailureMessage };
+      return;
+    }
+    const receipt = this.inboundTail.then(async () => {
+      const id = await this.inbound(message, this.previousInboundId, this.operationAbort.signal);
+      if (id) this.previousInboundId = id;
+    });
+    this.inboundTail = receipt;
+    this.inboundReceipts.add(receipt);
+    void receipt.finally(() => this.inboundReceipts.delete(receipt)).catch(() => undefined);
+  }
+
+  private async flushAck(originalAck: (eventId: number) => Promise<unknown>): Promise<void> {
+    await Promise.resolve();
+    for (;;) {
+      if (this.stopped || this.inboundFailed) return;
+      const receipts = [...this.inboundReceipts];
+      if (receipts.length) {
+        try {
+          await Promise.all(receipts);
+        } catch {
+          return;
+        }
+        continue;
+      }
+      const eventId = this.pendingAckId;
+      this.pendingAckId = -1;
+      if (eventId < 0) return;
+      try {
+        await originalAck(eventId);
+      } catch (error) {
+        if (!this.stopped) this.state = { status: "error", message: errMessage(error) };
+        return;
+      }
+      if (this.pendingAckId < 0) return;
+    }
+  }
+
+  private installDurableAck(client: Urbit): void {
+    const airlock = client as unknown as {
+      ack?: (eventId: number) => Promise<unknown>;
+    };
+    if (typeof airlock.ack !== "function") return;
+    const originalAck = airlock.ack.bind(client);
+    airlock.ack = async (eventId) => {
+      this.pendingAckId = Math.max(this.pendingAckId, eventId);
+      if (!this.ackTask) {
+        this.ackTask = this.flushAck(originalAck).finally(() => {
+          this.ackTask = null;
+        });
+      }
+      await this.ackTask;
     };
   }
 
   private receive(source: string, value: unknown, parse: typeof parseChannelMessage | typeof parseDmMessage): void {
     try {
-      void this.inbound(parse(this.installation, value, storyToText));
+      const message = parse(this.installation, value, storyToText);
+      if (!message || this.stopped) return;
+      this.trackInbound(message);
     } catch (error) {
       console.error(
         `[tlon] ${source} event for ${this.installation.id} failed:`,
@@ -166,11 +439,13 @@ export class TlonConnection {
         this.installation.ship,
         this.installation.code,
         transport.fetch,
+        () => this.activeOperationSignal,
       );
       if (this.stopped) throw new Error("Tlon connection stopped during startup");
       client = this.createClient(this.installation.url, authenticatedFetch);
       client.nodeId = this.installation.ship;
       this.client = client;
+      this.installDurableAck(client);
       await client.poke({ app: "hood", mark: "helm-hi", json: "opening airlock" });
       await client.eventSource();
       if (this.stopped) throw new Error("Tlon connection stopped during startup");
@@ -223,45 +498,121 @@ export class TlonConnection {
   }
 
   private updateStatus(status: ChannelStatus, message?: string): void {
+    if (this.inboundFailed) return;
     if (status === "active" || status === "reconnected") this.state = { status: "connected" };
     else if (status === "errored") this.state = { status: "error", ...(message ? { message } : {}) };
     else if (this.state.status !== "error") this.state = { status: "connecting", ...(message ? { message } : {}) };
   }
 
   runtimeStatus(): { status: "connecting" | "connected" | "error"; message?: string } {
+    if (this.inboundFailed) return { status: "error", message: this.inboundFailureMessage };
     return this.state;
   }
 
-  async deliver(delivery: Delivery): Promise<void> {
+  async deliver(delivery: Delivery, signal?: AbortSignal): Promise<void> {
     const client = this.client;
     if (!client) throw new Error(`Tlon account ${this.installation.id} is not connected`);
     const target = decodeDeliveryTarget(delivery.destination.target);
     if (target.accountId !== this.installation.id) throw new Error("delivery belongs to another Tlon account");
+    if (target.accountVersion && target.accountVersion !== this.installation.version) {
+      throw new Error("delivery belongs to another Tlon installation version");
+    }
+    const revocationSignal = signal
+      ? AbortSignal.any([this.operationAbort.signal, signal])
+      : this.operationAbort.signal;
+    const operationSignal = AbortSignal.any([revocationSignal, AbortSignal.timeout(this.operationTimeoutMs)]);
+    this.activeOperationSignal = operationSignal;
     try {
       await withApi(this.installation, client, async () => {
         const content = markdownToStory(delivery.text);
+        let blob: string | undefined;
+        let aggregateBytes = 0;
+        const manifest = (delivery.attachments ?? []).map((attachment, index) => {
+          const accepted =
+            index < MAX_TLON_ATTACHMENTS &&
+            attachment.sizeBytes >= 0 &&
+            aggregateBytes + attachment.sizeBytes <= MAX_TLON_ATTACHMENT_BYTES;
+          if (accepted) aggregateBytes += attachment.sizeBytes;
+          return { attachment, index, accepted };
+        });
+        for (const { attachment, index, accepted } of manifest) {
+          const name = safeMediaName(attachment.name);
+          if (!accepted) {
+            content.push({ inline: [`Attachment ${name} could not be sent.`] });
+            continue;
+          }
+          try {
+            if (!this.readAttachment) throw new Error("Tlon delivery attachment transfer is not configured");
+            const bytes = await withSignal(this.readAttachment(delivery.id, index, operationSignal), operationSignal);
+            if (bytes.byteLength !== attachment.sizeBytes) {
+              throw new Error(`${name} changed size before Tlon delivery`);
+            }
+            const uploaded = await withSignal(
+              this.uploadAttachment(attachment, bytes, delivery.id, index, operationSignal),
+              operationSignal,
+            );
+            const url = await withSignal(this.validateUploadUrl(uploaded.url), operationSignal);
+            if (attachment.mimetype.toLowerCase().startsWith("image/")) {
+              content.push({
+                block: {
+                  image: { src: url, width: 0, height: 0, alt: name },
+                },
+              });
+            } else if (attachment.mimetype.toLowerCase().startsWith("video/")) {
+              blob = appendVideoToPostBlob(blob, {
+                fileUri: url,
+                mimeType: attachment.mimetype,
+                name,
+                size: attachment.sizeBytes,
+              });
+            } else {
+              blob = appendFileUploadToPostBlob(blob, {
+                fileUri: url,
+                mimeType: attachment.mimetype,
+                name,
+                size: attachment.sizeBytes,
+              });
+            }
+          } catch {
+            if (revocationSignal.aborted) throw revocationSignal.reason;
+            content.push({ inline: [`Attachment ${name} could not be sent.`] });
+          }
+        }
+        if (!content.length) content.push({ inline: [""] });
         const sentAt = deliveryTime(delivery);
+        const sendSignal = AbortSignal.any([revocationSignal, AbortSignal.timeout(this.operationTimeoutMs)]);
+        this.activeOperationSignal = sendSignal;
         if (target.replyTo) {
-          await sendReply({
-            channelId: target.target,
-            parentId: target.replyTo,
-            parentAuthor: target.parentAuthor ?? (target.kind === "dm" ? target.target : ""),
-            content,
-            sentAt,
-            authorId: this.installation.ship,
-          });
+          await withSignal(
+            sendReply({
+              channelId: target.target,
+              parentId: target.replyTo,
+              parentAuthor: target.parentAuthor ?? (target.kind === "dm" ? target.target : ""),
+              content,
+              sentAt,
+              authorId: this.installation.ship,
+              ...(blob ? { blob } : {}),
+            }),
+            sendSignal,
+          );
         } else {
-          await sendPost({
-            channelId: target.target,
-            content,
-            sentAt,
-            authorId: this.installation.ship,
-          });
+          await withSignal(
+            sendPost({
+              channelId: target.target,
+              content,
+              sentAt,
+              authorId: this.installation.ship,
+              ...(blob ? { blob } : {}),
+            }),
+            sendSignal,
+          );
         }
       });
     } catch (error) {
       this.state = { status: "error", message: errMessage(error) };
       throw error;
+    } finally {
+      this.activeOperationSignal = null;
     }
   }
 
@@ -296,6 +647,7 @@ export class TlonConnection {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.operationAbort.abort();
     const client = this.client;
     const transport = this.transport;
     const contexts = [...this.presenceContexts];

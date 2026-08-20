@@ -223,6 +223,7 @@ export function createTurnMethods(
       const input = {
         surface: req.surface,
         ...(req.deliveryTarget ? { deliveryTarget: req.deliveryTarget } : {}),
+        ...(req.deliveryQueueKey ? { deliveryQueueKey: req.deliveryQueueKey } : {}),
         ...(req.deliveryCandidates?.length ? { deliveryCandidates: req.deliveryCandidates } : {}),
         actor,
         conversation,
