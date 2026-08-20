@@ -40,7 +40,68 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
   assert.ok(calls.some((args) => args.join(" ") === `network create ${secondName}-net`));
   assert.ok(calls.some((args) => args.join(" ").includes(`--name ${firstName} --network ${firstName}-net`)));
   assert.ok(calls.some((args) => args.join(" ").includes(`--name ${secondName} --network ${secondName}-net`)));
+  assert.ok(calls.some((args) => args.join(" ") === `cp /snap/one/. ${firstName}-seed:/app`));
+  assert.ok(calls.some((args) => args.includes(`type=volume,src=${firstName}-app,dst=/app,readonly,volume-nocopy`)));
+  assert.ok(calls.some((args) => args.includes(`type=volume,src=${firstName}-app,dst=/app,volume-nocopy`)));
+  assert.equal(
+    calls.some((args) => args.includes("/snap/one:/app:ro")),
+    false,
+  );
+  assert.ok(calls.some((args) => args.join(" ") === `volume rm -f ${firstName}-app`));
   assert.ok(calls.some((args) => args.join(" ") === `network rm ${firstName}-net`));
+});
+
+test("Docker deployment aborts and cleans up when the app snapshot cannot be copied", async () => {
+  const calls: string[][] = [];
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "cp") return { code: 1, stdout: "", stderr: "copy failed" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/missing",
+  });
+  const provider = createDockerDeployProvider({ dockerExec });
+  const runtimeName = `agent-deploy-${deployment.id.slice(0, 12)}`;
+
+  await assert.rejects(provider.apply(deployment, deployment.versions[0]!), /deploy app copy failed: copy failed/);
+  assert.ok(calls.some((args) => args.join(" ") === `rm -f ${runtimeName}-seed`));
+  assert.ok(calls.some((args) => args.join(" ") === `volume rm -f ${runtimeName}-app`));
+  assert.ok(calls.some((args) => args.join(" ") === `network rm ${runtimeName}-net`));
+  assert.equal(
+    calls.some((args) => args[0] === "run"),
+    false,
+  );
+});
+
+test("Docker deployment stops before copying when the old app volume cannot be removed", async () => {
+  const calls: string[][] = [];
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    if (args[0] === "volume" && args[1] === "rm") {
+      return { code: 1, stdout: "", stderr: "volume is in use" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/new",
+  });
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  await assert.rejects(provider.apply(deployment, deployment.versions[0]!), /deploy volume cleanup failed/);
+  assert.equal(
+    calls.some((args) => args[0] === "cp" || (args[0] === "volume" && args[1] === "create")),
+    false,
+  );
 });
 
 test("Docker provider migrates running deployments off the legacy shared network", async () => {

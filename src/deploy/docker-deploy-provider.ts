@@ -37,6 +37,19 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
 
   const name = (d: Deployment) => `agent-deploy-${d.id.slice(0, 12)}`;
   const network = (d: Deployment) => `${name(d)}-net`;
+  const appVolume = (d: Deployment) => `${name(d)}-app`;
+  const seedContainer = (d: Deployment) => `${name(d)}-seed`;
+  const remove = async (args: string[], resource: string): Promise<void> => {
+    const removed = await dexec(args);
+    if (removed.code !== 0 && !/no such (?:object|container|volume)|not found/i.test(removed.stderr)) {
+      throw new Error(`deploy ${resource} cleanup failed: ${removed.stderr.trim()}`);
+    }
+  };
+  const removeRuntime = async (d: Deployment): Promise<void> => {
+    await remove(["rm", "-f", name(d)], "container");
+    await remove(["rm", "-f", seedContainer(d)], "seed");
+    await remove(["volume", "rm", "-f", appVolume(d)], "volume");
+  };
   const ensureNetwork = async (net: string): Promise<string> => {
     if ((await dexec(["network", "inspect", net])).code !== 0) {
       const r = await dexec(["network", "create", net]);
@@ -84,8 +97,38 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
     profile: { managedScaleToZero: false },
 
     async apply(d: Deployment, version: DeploymentVersion): Promise<DeployEndpoint> {
+      await removeRuntime(d);
       const net = await ensureNetwork(network(d));
-      await dexec(["rm", "-f", name(d)]);
+      const createdVolume = await dexec(["volume", "create", appVolume(d)]);
+      if (createdVolume.code !== 0) {
+        await dexec(["network", "rm", net]);
+        throw new Error(`deploy volume create failed: ${createdVolume.stderr.trim()}`);
+      }
+      const seed = await dexec([
+        "create",
+        "--name",
+        seedContainer(d),
+        "--mount",
+        `type=volume,src=${appVolume(d)},dst=/app,volume-nocopy`,
+        image,
+      ]);
+      if (seed.code !== 0) {
+        await removeRuntime(d);
+        await dexec(["network", "rm", net]);
+        throw new Error(`deploy seed create failed: ${seed.stderr.trim()}`);
+      }
+      const copied = await dexec(["cp", `${version.snapshotDir}/.`, `${seedContainer(d)}:/app`]);
+      if (copied.code !== 0) {
+        await removeRuntime(d);
+        await dexec(["network", "rm", net]);
+        throw new Error(`deploy app copy failed: ${copied.stderr.trim()}`);
+      }
+      const removedSeed = await dexec(["rm", "-f", seedContainer(d)]);
+      if (removedSeed.code !== 0) {
+        await removeRuntime(d);
+        await dexec(["network", "rm", net]);
+        throw new Error(`deploy seed cleanup failed: ${removedSeed.stderr.trim()}`);
+      }
       const hostPort = allocPort(name(d));
       const envArgs = Object.entries(version.env ?? {}).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
       const r = await dexec([
@@ -103,8 +146,8 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
         "256",
         "-p",
         `127.0.0.1:${hostPort}:${APP_PORT}`,
-        "-v",
-        `${version.snapshotDir}:/app:ro`,
+        "--mount",
+        `type=volume,src=${appVolume(d)},dst=/app,readonly,volume-nocopy`,
         "-w",
         "/app",
         "-e",
@@ -116,7 +159,7 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
         version.entrypoint,
       ]);
       if (r.code !== 0) {
-        await dexec(["rm", "-f", name(d)]);
+        await removeRuntime(d);
         await dexec(["network", "rm", net]);
         freePort(name(d));
         throw new Error(`deploy run failed: ${r.stderr.trim()}`);
@@ -133,7 +176,7 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
     },
 
     async destroy(d: Deployment): Promise<void> {
-      await dexec(["rm", "-f", name(d)]);
+      await removeRuntime(d);
       await dexec(["network", "rm", network(d)]);
       freePort(name(d));
     },
