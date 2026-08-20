@@ -7,6 +7,8 @@ export interface Installation {
   ownerShip: string;
   channels: string[];
   respondWithoutMention: boolean;
+  ownerVerified: boolean;
+  sharedChannelsEnabled: boolean;
   version: string;
 }
 
@@ -21,12 +23,13 @@ export interface DeliveryTarget {
 
 export interface Delivery {
   id: string;
-  destination: { type: string; target: string };
+  destination: { type: string; target: string; scopeVersion?: string };
   text: string;
   attachments?: OutgoingAttachment[];
   idempotencyKey: string;
   createdAt: number;
   claimToken?: string;
+  connectorRef: number;
 }
 
 export interface IncomingAttachment {
@@ -58,14 +61,17 @@ export interface InboundMessage {
   blob?: string;
   attachments?: IncomingAttachment[];
   inboundNotes?: string[];
+  externalPromptData?: Array<{ source: string; content: string }>;
   kind: "dm" | "channel";
   target: string;
   threadRoot?: string;
   parentAuthor?: string;
+  scopeVersion?: string;
 }
 
 export interface InboundRecord {
   id: string;
+  queueKey: string;
   message: InboundMessage;
   previousId?: string;
   createdAt: number;
@@ -79,4 +85,5 @@ export interface RunPresence {
   conversationId: string;
   status: "pending" | "running" | "done" | "failed";
   activeTools: string[];
+  scopeVersion?: string;
 }

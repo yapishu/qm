@@ -12,7 +12,7 @@ import type { TurnOrigin } from "../turn-origin.ts";
 import type { IdentityService } from "../../identity/identity-service.ts";
 import type { ResolutionService } from "../../resolution/resolution-service.ts";
 import type { OrgBranding, ScopedConfigStore } from "../../resolution/config-store.ts";
-import type { ManagedGroupDirectory } from "../../resolution/scope-membership.ts";
+import type { ManagedChannelDirectory, ManagedGroupDirectory } from "../../resolution/scope-membership.ts";
 import type { DirectoryStore } from "../../directory/directory-store.ts";
 import type { EnvironmentStore } from "../../environments/environment-store.ts";
 import type { SessionStore } from "../../sessions/session-store.ts";
@@ -163,6 +163,7 @@ export interface OrchestratorDeps {
   deliveries?: DeliveryStore;
   directory?: DirectoryStore;
   managedGroups?: Pick<ManagedGroupDirectory, "recognizes" | "members" | "version" | "withVersion" | "slackChannel">;
+  managedChannels?: Pick<ManagedChannelDirectory, "recognizes" | "members" | "version" | "withVersion">;
   reachExec?: boolean;
   eagerProvision?: boolean;
   environments?: EnvironmentStore;

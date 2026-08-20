@@ -7,6 +7,7 @@ import { LEGACY_CRON_ID_PATTERN, STABLE_CRON_ID_PATTERN } from "../sessions/sess
 function rowToDelivery(r: Record<string, unknown>): Delivery {
   return {
     id: r.id as string,
+    enqueueSeq: Number(r.enqueue_seq),
     destination: r.destination as Destination,
     text: r.text as string,
     ...(r.attachments != null ? { attachments: r.attachments as OutgoingAttachment[] } : {}),
@@ -19,6 +20,7 @@ function rowToDelivery(r: Record<string, unknown>): Delivery {
     ...(r.deliver_latency_ms != null ? { deliverLatencyMs: Number(r.deliver_latency_ms) } : {}),
     ...(r.slack_api_ms != null ? { slackApiMs: Number(r.slack_api_ms) } : {}),
     ...(r.claim_token != null ? { claimToken: r.claim_token as string } : {}),
+    ...(r.connector_ref != null ? { connectorRef: Number(r.connector_ref) } : {}),
   };
 }
 
@@ -42,6 +44,32 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS slack_api_ms INT`,
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS claim_expires_at BIGINT`,
     `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS claim_token TEXT`,
+    `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS connector_ref BIGINT`,
+    `CREATE SEQUENCE IF NOT EXISTS deliveries_enqueue_seq_seq`,
+    `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS enqueue_seq BIGINT`,
+    `ALTER TABLE deliveries ALTER COLUMN enqueue_seq SET DEFAULT nextval('deliveries_enqueue_seq_seq')`,
+    `WITH ordered AS (
+        SELECT id, nextval('deliveries_enqueue_seq_seq') AS seq
+          FROM deliveries
+         WHERE enqueue_seq IS NULL
+         ORDER BY created_at, id
+      )
+      UPDATE deliveries
+         SET enqueue_seq = ordered.seq
+        FROM ordered
+       WHERE deliveries.id = ordered.id`,
+    `ALTER TABLE deliveries ALTER COLUMN enqueue_seq SET NOT NULL`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_connector_ref
+        ON deliveries (connector_ref) WHERE connector_ref IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_deliveries_enqueue_seq
+        ON deliveries (enqueue_seq)`,
+    `CREATE TABLE IF NOT EXISTS delivery_connector_clock(
+        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+        next_at BIGINT NOT NULL
+      )`,
+    `INSERT INTO delivery_connector_clock(singleton, next_at)
+        VALUES (TRUE, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+        ON CONFLICT (singleton) DO NOTHING`,
     `CREATE INDEX IF NOT EXISTS idx_deliveries_recipient_thread
         ON deliveries (recipient_thread_ref, created_at) WHERE recipient_thread_ref IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_deliveries_shadow
@@ -82,7 +110,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
     },
     async pending(type) {
       const rows = await q(
-        "SELECT * FROM deliveries WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1 ORDER BY created_at",
+        "SELECT * FROM deliveries WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1 ORDER BY enqueue_seq",
         [type],
       );
       return rows.map(rowToDelivery);
@@ -96,7 +124,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
              SELECT id,
                     ROW_NUMBER() OVER (
                       PARTITION BY COALESCE(destination->>'queueKey', '')
-                      ORDER BY created_at, id
+                      ORDER BY enqueue_seq
                     ) AS position
                FROM deliveries
               WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1
@@ -107,7 +135,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
               WHERE ranked.position = 1
                 AND (claim_expires_at IS NULL
                   OR claim_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
-              ORDER BY created_at, id
+              ORDER BY enqueue_seq
               LIMIT $3
               FOR UPDATE OF deliveries SKIP LOCKED
            )
@@ -118,7 +146,7 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
             RETURNING *`,
           [type, ttlMs, rowLimit, claimToken],
         );
-        return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+        return rows.map(rowToDelivery).sort((a, b) => a.enqueueSeq! - b.enqueueSeq!);
       }
       const rows = await q(
         `UPDATE deliveries
@@ -129,14 +157,14 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
              WHERE delivered_at IS NULL AND NOT shadow AND destination->>'type' = $1
                AND (claim_expires_at IS NULL
                  OR claim_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
-             ORDER BY created_at
+             ORDER BY enqueue_seq
              LIMIT $3
                FOR UPDATE SKIP LOCKED
           )
           RETURNING *`,
         [type, ttlMs, rowLimit, claimToken],
       );
-      return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+      return rows.map(rowToDelivery).sort((a, b) => a.enqueueSeq! - b.enqueueSeq!);
     },
     async releaseClaim(id, claimToken) {
       const rows = await q(
@@ -148,6 +176,42 @@ export function createPostgresDeliveryStore(connectionString: string): DeliveryS
         [id, claimToken],
       );
       return rows.length > 0;
+    },
+    async reserveConnectorRef(id, claimToken) {
+      const existing = await q(
+        `SELECT connector_ref
+           FROM deliveries
+          WHERE id = $1 AND delivered_at IS NULL AND claim_token = $2 AND connector_ref IS NOT NULL`,
+        [id, claimToken],
+      );
+      if (existing[0]) return Number(existing[0].connector_ref);
+      const allocated = await q(
+        `WITH claimed AS (
+           SELECT id
+             FROM deliveries
+            WHERE id = $1 AND delivered_at IS NULL AND claim_token = $2 AND connector_ref IS NULL
+            FOR UPDATE
+         ), tick AS (
+           UPDATE delivery_connector_clock
+              SET next_at = GREATEST(next_at + 1, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+            WHERE singleton AND EXISTS (SELECT 1 FROM claimed)
+            RETURNING next_at
+         )
+         UPDATE deliveries
+            SET connector_ref = tick.next_at
+           FROM claimed, tick
+          WHERE deliveries.id = claimed.id
+          RETURNING deliveries.connector_ref`,
+        [id, claimToken],
+      );
+      if (allocated[0]) return Number(allocated[0].connector_ref);
+      const raced = await q(
+        `SELECT connector_ref
+           FROM deliveries
+          WHERE id = $1 AND delivered_at IS NULL AND claim_token = $2 AND connector_ref IS NOT NULL`,
+        [id, claimToken],
+      );
+      return raced[0] ? Number(raced[0].connector_ref) : null;
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);

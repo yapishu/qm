@@ -1,4 +1,4 @@
-import { decodeDeliveryTarget } from "./target.ts";
+import { decodeDeliveryTarget, encodeDeliveryTarget } from "./target.ts";
 import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { CoreClient } from "./core.ts";
 import { TlonConnection } from "./tlon.ts";
@@ -13,6 +13,7 @@ interface ManagedConnection {
   enrichInbound(message: InboundMessage, signal?: AbortSignal): Promise<InboundMessage>;
   publishPresence(conversationId: string, toolNames: string[]): Promise<void>;
   clearPresence(conversationId: string): Promise<void>;
+  verifiedChannels?(): Promise<string[]>;
 }
 
 type ConnectionFactory = (
@@ -73,6 +74,7 @@ export class TlonController {
   private readonly core: CoreClient;
   private readonly connectionFactory: ConnectionFactory;
   private readonly connections = new Map<string, ManagedConnection>();
+  private readonly verifiedChannels = new Map<string, { version: string; channels: Set<string> }>();
   private readonly abort = new AbortController();
   private reconcileTask: Promise<void> | null = null;
   private deliveryTask: Promise<void> | null = null;
@@ -117,24 +119,45 @@ export class TlonController {
         this.dropAccountPresence(presence.accountId);
       }
     }
-    for (const [id, connection] of this.connections) {
-      const next = desired.get(id);
-      if (next?.version === connection.installation.version) {
-        const runtime = connection.runtimeStatus();
-        await this.core
-          .report(id, next.version, runtime.status, runtime.message)
-          .catch((error) => swallow(`report Tlon connection ${id}`, error));
-        if (runtime.status !== "error") continue;
-        this.scheduleRetry(id, next.version);
-      }
-      this.connections.delete(id);
-      await connection.stop().catch((error) => swallow(`stop Tlon connection ${id}`, error));
-      this.forgetPublishedPresence(id);
-      if (!next || next.version !== connection.installation.version)
-        await this.core
-          .report(id, connection.installation.version, "stopped")
-          .catch((error) => swallow(`report stopped Tlon connection ${id}`, error));
-    }
+    await Promise.all(
+      [...this.connections].map(async ([id, connection]) => {
+        const next = desired.get(id);
+        if (next?.version === connection.installation.version) {
+          let runtime = connection.runtimeStatus();
+          let verifiedChannels: string[] | undefined;
+          if (runtime.status === "connected") {
+            try {
+              verifiedChannels = await within(connection.verifiedChannels?.() ?? Promise.resolve([]), 30_000);
+            } catch (error) {
+              runtime = { status: "error", message: `channel verification failed: ${errMessage(error)}` };
+              verifiedChannels = [];
+            }
+          }
+          let reportFailed = false;
+          await this.core.report(id, next.version, runtime.status, runtime.message, verifiedChannels).then(
+            () => {
+              if (verifiedChannels) {
+                this.verifiedChannels.set(id, { version: next.version, channels: new Set(verifiedChannels) });
+              }
+            },
+            (error) => {
+              swallow(`report Tlon connection ${id}`, error);
+              reportFailed = verifiedChannels !== undefined;
+            },
+          );
+          if (runtime.status !== "error" && !reportFailed) return;
+          this.scheduleRetry(id, next.version);
+        }
+        this.connections.delete(id);
+        this.verifiedChannels.delete(id);
+        await connection.stop().catch((error) => swallow(`stop Tlon connection ${id}`, error));
+        this.forgetPublishedPresence(id);
+        if (!next || next.version !== connection.installation.version)
+          await this.core
+            .report(id, connection.installation.version, "stopped")
+            .catch((error) => swallow(`report stopped Tlon connection ${id}`, error));
+      }),
+    );
     await Promise.all(
       installations
         .filter((installation) => {
@@ -163,7 +186,12 @@ export class TlonController {
             await this.whileInstallationCurrent(installation.id, installation.version, async () => {
               try {
                 await within(connection.start(), 30_000);
-                await this.core.report(installation.id, installation.version, "connected");
+                const verifiedChannels = await within(connection.verifiedChannels?.() ?? Promise.resolve([]), 30_000);
+                await this.core.report(installation.id, installation.version, "connected", undefined, verifiedChannels);
+                this.verifiedChannels.set(installation.id, {
+                  version: installation.version,
+                  channels: new Set(verifiedChannels),
+                });
                 this.connections.set(installation.id, connection);
                 this.retries.delete(installation.id);
                 this.syncAccountPresence(installation.id);
@@ -174,6 +202,7 @@ export class TlonController {
             });
           } catch (error) {
             this.connections.delete(installation.id);
+            this.verifiedChannels.delete(installation.id);
             await stopConnection();
             if (error instanceof InstallationChangedError) {
               const retry = this.retries.get(installation.id);
@@ -237,8 +266,10 @@ export class TlonController {
     accountId: string,
     accountVersion: string,
     action: (signal: AbortSignal) => Promise<T>,
+    channel?: string,
+    scopeVersion?: string,
   ): Promise<T> {
-    const token = await this.core.acquire(accountId, accountVersion);
+    const token = await this.core.acquire(accountId, accountVersion, channel, scopeVersion);
     if (!token) throw new InstallationChangedError("Tlon installation changed");
     try {
       return await action(this.abort.signal);
@@ -254,16 +285,24 @@ export class TlonController {
 
   private async processInbound(): Promise<void> {
     const records = await this.core.inboundRecords();
-    const byAccount = new Map<string, typeof records>();
+    const byQueue = new Map<string, typeof records>();
     for (const record of records) {
-      const accountRecords = byAccount.get(record.message.accountId) ?? [];
-      accountRecords.push(record);
-      byAccount.set(record.message.accountId, accountRecords);
+      const queueRecords = byQueue.get(record.queueKey) ?? [];
+      queueRecords.push(record);
+      byQueue.set(record.queueKey, queueRecords);
     }
     await Promise.all(
-      [...byAccount.values()].map(async (accountRecords) => {
-        for (const record of accountRecords) {
+      [...byQueue.values()].map(async (queueRecords) => {
+        for (const record of queueRecords) {
           try {
+            if (this.abort.signal.aborted) {
+              await this.core.releaseInbound(record.id, record.claimToken).catch(() => undefined);
+              break;
+            }
+            if (record.message.kind === "channel" && !record.message.scopeVersion) {
+              await this.core.ackInbound(record.id, record.claimToken);
+              continue;
+            }
             const connection = this.connections.get(record.message.accountId);
             if (!connection || connection.installation.version !== record.message.installationVersion) {
               const token = await this.core.acquire(record.message.accountId, record.message.installationVersion);
@@ -285,9 +324,15 @@ export class TlonController {
                 );
                 await this.acceptTurn(record.message.accountId, message, signal);
               },
+              record.message.kind === "channel" ? record.message.target : undefined,
+              record.message.scopeVersion,
             );
             await this.core.ackInbound(record.id, record.claimToken);
           } catch (error) {
+            if (this.abort.signal.aborted) {
+              await this.core.releaseInbound(record.id, record.claimToken).catch(() => undefined);
+              break;
+            }
             if (error instanceof InstallationChangedError) {
               await this.core.ackInbound(record.id, record.claimToken).catch(() => undefined);
               continue;
@@ -485,56 +530,129 @@ export class TlonController {
 
   private async deliverPending(): Promise<void> {
     const deliveries = await this.core.deliveries();
-    const byAccount = new Map<string, Delivery[]>();
-    for (const delivery of deliveries) {
-      const accountId = decodeDeliveryTarget(delivery.destination.target).accountId;
-      const accountDeliveries = byAccount.get(accountId) ?? [];
-      accountDeliveries.push(delivery);
-      byAccount.set(accountId, accountDeliveries);
-    }
     const delivered = await Promise.all(
-      [...byAccount.values()].map(async (accountDeliveries) => {
-        let anyDelivered = false;
-        for (const delivery of accountDeliveries) {
-          try {
-            const target = decodeDeliveryTarget(delivery.destination.target);
-            if (!target.accountVersion || !delivery.claimToken) {
+      deliveries.map(async (delivery) => {
+        try {
+          if (this.abort.signal.aborted) {
+            if (delivery.claimToken)
+              await this.core.releaseDelivery(delivery.id, delivery.claimToken).catch(() => undefined);
+            return false;
+          }
+          const target = decodeDeliveryTarget(delivery.destination.target);
+          if (!target.accountVersion || !delivery.claimToken) {
+            await this.core.ack(delivery.id);
+            return false;
+          }
+          const scopeVersion = target.kind === "channel" ? delivery.destination.scopeVersion : undefined;
+          if (target.kind === "channel" && !scopeVersion) {
+            await this.core.ack(delivery.id);
+            return false;
+          }
+          const preferred = this.connections.get(target.accountId);
+          const connections = [
+            ...(preferred?.installation.version === target.accountVersion &&
+            (target.kind === "dm" ||
+              this.verifiedChannels.get(preferred.installation.id)?.channels.has(target.target) === true)
+              ? [preferred]
+              : []),
+            ...(target.kind === "channel"
+              ? [...this.connections.values()].filter(
+                  (candidate) =>
+                    candidate !== preferred &&
+                    this.verifiedChannels.get(candidate.installation.id)?.version === candidate.installation.version &&
+                    this.verifiedChannels.get(candidate.installation.id)?.channels.has(target.target),
+                )
+              : []),
+          ].slice(0, 2);
+          if (!connections.length) {
+            if (
+              target.kind === "channel" &&
+              !(await this.core.channelScopeIsCurrent(target.target, scopeVersion!, this.abort.signal))
+            ) {
               await this.core.ack(delivery.id);
-              continue;
+              return false;
             }
-            const connection = this.connections.get(target.accountId);
-            if (!connection || connection.installation.version !== target.accountVersion) {
-              const token = await this.core.acquire(target.accountId, target.accountVersion);
-              if (!token) {
-                await this.core.ack(delivery.id);
+            const token = await this.core.acquire(target.accountId, target.accountVersion);
+            if (!token) {
+              await this.core.ack(delivery.id);
+              return false;
+            }
+            await this.core.release(target.accountId, target.accountVersion, token);
+            await this.core.releaseDelivery(delivery.id, delivery.claimToken);
+            return false;
+          }
+          const runId = delivery.idempotencyKey.startsWith("run:") ? delivery.idempotencyKey.slice("run:".length) : "";
+          const sourceToken = await this.core.acquire(target.accountId, target.accountVersion);
+          if (!sourceToken) {
+            await this.core.ack(delivery.id);
+            return false;
+          }
+          try {
+            const run = runId ? await this.core.run(target.accountId, runId, this.abort.signal) : null;
+            if (runId && !run) {
+              await this.core.ack(delivery.id);
+              return false;
+            }
+            if (target.kind === "channel" && runId && run?.scopeVersion !== scopeVersion) {
+              await this.core.ack(delivery.id);
+              return false;
+            }
+            for (const connection of connections) {
+              const candidateToken = await this.core.acquire(
+                connection.installation.id,
+                connection.installation.version,
+                target.kind === "channel" ? target.target : undefined,
+                scopeVersion,
+              );
+              if (!candidateToken) {
+                if (target.kind === "channel") {
+                  const cached = this.verifiedChannels.get(connection.installation.id);
+                  if (cached?.version === connection.installation.version) cached.channels.delete(target.target);
+                }
                 continue;
               }
-              await this.core.release(target.accountId, target.accountVersion, token);
-              await this.core.releaseDelivery(delivery.id, delivery.claimToken);
-              break;
+              const candidateTarget = encodeDeliveryTarget({
+                ...target,
+                accountId: connection.installation.id,
+                accountVersion: connection.installation.version,
+              });
+              try {
+                await connection.deliver(
+                  { ...delivery, destination: { ...delivery.destination, target: candidateTarget } },
+                  this.abort.signal,
+                );
+              } finally {
+                await this.core
+                  .release(connection.installation.id, connection.installation.version, candidateToken)
+                  .catch(() => undefined);
+              }
+              await this.core.ack(delivery.id);
+              return true;
             }
-            const runId = delivery.idempotencyKey.startsWith("run:")
-              ? delivery.idempotencyKey.slice("run:".length)
-              : "";
-            await this.whileInstallationCurrent(target.accountId, target.accountVersion, async (signal) => {
-              if (runId) await this.core.run(target.accountId, runId, signal);
-              await connection.deliver(delivery, signal);
-            });
-            await this.core.ack(delivery.id);
-            anyDelivered = true;
-          } catch (error) {
-            if (error instanceof InstallationChangedError) {
-              await this.core.ack(delivery.id).catch(() => undefined);
-              continue;
+            if (
+              target.kind === "channel" &&
+              !(await this.core.channelScopeIsCurrent(target.target, scopeVersion!, this.abort.signal))
+            ) {
+              await this.core.ack(delivery.id);
+              return false;
             }
-            console.error(
-              `[tlon] delivery ${delivery.id} failed:`,
-              error instanceof Error ? error.message : String(error),
-            );
-            break;
+            await this.core.releaseDelivery(delivery.id, delivery.claimToken);
+            return false;
+          } finally {
+            await this.core.release(target.accountId, target.accountVersion, sourceToken).catch(() => undefined);
           }
+        } catch (error) {
+          if (this.abort.signal.aborted) {
+            if (delivery.claimToken)
+              await this.core.releaseDelivery(delivery.id, delivery.claimToken).catch(() => undefined);
+            return false;
+          }
+          console.error(
+            `[tlon] delivery ${delivery.id} failed:`,
+            error instanceof Error ? error.message : String(error),
+          );
+          return false;
         }
-        return anyDelivered;
       }),
     );
     if (delivered.some(Boolean)) await this.refreshPresence();

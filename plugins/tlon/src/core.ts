@@ -4,9 +4,21 @@ import { MAX_TLON_ATTACHMENT_BYTES, readResponseBytes } from "./attachments.ts";
 import type { Delivery, InboundMessage, InboundRecord, Installation, RunPresence } from "./types.ts";
 import { encodeDeliveryTarget } from "./target.ts";
 
+class CoreRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export function conversationThreadRef(message: InboundMessage): string {
-  const timeline = `tlon:${message.accountId}:${message.kind}:${message.target}`;
-  return message.threadRoot ? `${timeline}:thread:${message.threadRoot}` : timeline;
+  const timeline =
+    message.kind === "channel"
+      ? `tlon:channel:${encodeURIComponent(message.target)}`
+      : `tlon:${message.accountId}:${message.kind}:${message.target}`;
+  return message.threadRoot ? `${timeline}:thread:${encodeURIComponent(message.threadRoot)}` : timeline;
 }
 
 export class CoreClient {
@@ -30,7 +42,10 @@ export class CoreClient {
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     });
     if (!response.ok)
-      throw new Error(`${method} ${rawPath} failed with HTTP ${response.status}: ${await response.text()}`);
+      throw new CoreRequestError(
+        response.status,
+        `${method} ${rawPath} failed with HTTP ${response.status}: ${await response.text()}`,
+      );
     return (await response.json()) as T;
   }
 
@@ -45,19 +60,26 @@ export class CoreClient {
     return result.installations;
   }
 
-  async report(id: string, version: string, status: string, message?: string): Promise<void> {
+  async report(
+    id: string,
+    version: string,
+    status: string,
+    message?: string,
+    verifiedChannels?: string[],
+  ): Promise<void> {
     await this.request("POST", `/v1/tlon/installations/${encodeURIComponent(id)}/status`, {
       version,
       status,
       ...(message ? { message } : {}),
+      ...(verifiedChannels ? { verifiedChannels } : {}),
     });
   }
 
-  async acquire(id: string, version: string): Promise<string | null> {
+  async acquire(id: string, version: string, channel?: string, scopeVersion?: string): Promise<string | null> {
     const result = await this.request<{ token?: unknown }>(
       "POST",
       `/v1/tlon/installations/${encodeURIComponent(id)}/lease`,
-      { version },
+      { version, ...(channel ? { channel } : {}), ...(scopeVersion ? { scopeVersion } : {}) },
     );
     if (result.token !== null && typeof result.token !== "string") {
       throw new Error("core returned an invalid Tlon operation lease");
@@ -85,20 +107,27 @@ export class CoreClient {
       {
         surface: "tlon",
         deliveryTarget: target,
-        deliveryQueueKey: `tlon:${message.accountId}:${message.installationVersion}`,
-        actor: { externalId: message.principalId, displayName: message.senderShip },
+        deliveryQueueKey:
+          message.kind === "channel"
+            ? `tlon:channel:${encodeURIComponent(message.target)}`
+            : `tlon:${message.accountId}:${message.installationVersion}`,
+        actor: { externalId: message.principalId, displayName: message.principalId },
         conversation: {
           kind: message.kind === "dm" ? "dm" : "channel",
           threadRef: conversationThreadRef(message),
           ...(message.kind === "channel"
-            ? { channelRef: `tlon:${message.accountId}:${message.target}`, channelName }
+            ? { channelRef: `tlon:${encodeURIComponent(message.target)}`, channelName, isPrivate: true }
             : { isPrivate: true }),
         },
         text: message.text,
         ...(message.attachments?.length ? { attachments: message.attachments } : {}),
         ...(message.inboundNotes?.length ? { inboundNotes: message.inboundNotes } : {}),
+        ...(message.externalPromptData?.length ? { externalPromptData: message.externalPromptData } : {}),
         triggerTs: message.messageId,
-        idempotencyKey: `tlon:${message.accountId}:${message.installationVersion}:${message.messageId}`,
+        idempotencyKey:
+          message.kind === "channel"
+            ? `tlon:channel:${encodeURIComponent(message.target)}:${encodeURIComponent(message.senderShip)}:${message.messageId}`
+            : `tlon:${message.accountId}:${message.installationVersion}:${message.messageId}`,
         addressed: true,
         liveActor: true,
         async: true,
@@ -128,9 +157,11 @@ export class CoreClient {
         (record) =>
           !record ||
           typeof record.id !== "string" ||
+          typeof record.queueKey !== "string" ||
           typeof record.claimToken !== "string" ||
           !record.message ||
-          typeof record.message.accountId !== "string",
+          typeof record.message.accountId !== "string" ||
+          (record.message.kind === "channel" && typeof record.message.scopeVersion !== "string"),
       )
     )
       throw new Error("core returned an invalid Tlon inbound queue");
@@ -151,13 +182,30 @@ export class CoreClient {
     return result.runs;
   }
 
-  run(accountId: string, runId: string, signal?: AbortSignal): Promise<RunPresence> {
-    return this.request(
+  async run(accountId: string, runId: string, signal?: AbortSignal): Promise<RunPresence | null> {
+    try {
+      return await this.request(
+        "GET",
+        `/v1/tlon/presence/runs/${encodeURIComponent(accountId)}/${encodeURIComponent(runId)}`,
+        undefined,
+        signal,
+      );
+    } catch (error) {
+      if (error instanceof CoreRequestError && error.status === 409) return null;
+      throw error;
+    }
+  }
+
+  async channelScopeIsCurrent(channel: string, scopeVersion: string, signal?: AbortSignal): Promise<boolean> {
+    const query = new URLSearchParams({ channel, scopeVersion });
+    const result = await this.request<{ current?: unknown }>(
       "GET",
-      `/v1/tlon/presence/runs/${encodeURIComponent(accountId)}/${encodeURIComponent(runId)}`,
+      `/v1/tlon/channel-scope?${query.toString()}`,
       undefined,
       signal,
     );
+    if (typeof result.current !== "boolean") throw new Error("core returned an invalid Tlon channel scope status");
+    return result.current;
   }
 
   async deliveries(): Promise<Delivery[]> {
@@ -167,7 +215,14 @@ export class CoreClient {
     );
     if (
       !Array.isArray(result.deliveries) ||
-      result.deliveries.some((delivery) => !delivery || typeof delivery.claimToken !== "string")
+      result.deliveries.some(
+        (delivery) =>
+          !delivery ||
+          typeof delivery.claimToken !== "string" ||
+          typeof delivery.connectorRef !== "number" ||
+          !Number.isSafeInteger(delivery.connectorRef) ||
+          delivery.connectorRef <= 0,
+      )
     ) {
       throw new Error("core returned an invalid Tlon delivery list");
     }

@@ -25,6 +25,9 @@ interface TlonConnection {
   respondWithoutMention: boolean;
   runtimeStatus: "pending" | "connecting" | "connected" | "error" | "stopped";
   runtimeMessage?: string;
+  ownerVerified: boolean;
+  ownerVerificationCode?: string;
+  sharedChannelsEnabled: boolean;
 }
 
 interface TlonDraft {
@@ -466,6 +469,7 @@ function editTlon(connection?: TlonConnection): void {
 }
 
 function tlonStatus(connection: TlonConnection): TemplateResult {
+  if (!connection.ownerVerified) return html`<span class="kc-state warning">Verify owner</span>`;
   if (connection.runtimeStatus === "connected") return html`<span class="kc-state">Online</span>`;
   if (connection.runtimeStatus === "error") return html`<span class="kc-state warning">Connection error</span>`;
   if (connection.runtimeStatus === "connecting") return html`<span class="kc-state neutral">Connecting…</span>`;
@@ -586,6 +590,22 @@ function tlonCard(): TemplateResult {
             <div>
               <strong>${connection.ship}</strong> ${tlonStatus(connection)}
               <div>${connection.url} · owner ${connection.ownerShip}</div>
+              ${
+                connection.ownerVerificationCode
+                  ? html`<div class="kc-inline-warning">
+                      DM <strong>${connection.ship}</strong> from <strong>${connection.ownerShip}</strong> with
+                      <code>/qm-link ${connection.ownerVerificationCode}</code>
+                    </div>`
+                  : ""
+              }
+              ${
+                connection.channels.length && !connection.sharedChannelsEnabled
+                  ? html`<div class="kc-inline-warning">
+                      Shared channel workspaces require the canonical
+                      <code>https://${connection.ship.slice(1)}.tlon.network</code> ship URL.
+                    </div>`
+                  : ""
+              }
               ${connection.runtimeMessage ? html`<div class="kc-inline-warning">${connection.runtimeMessage}</div>` : ""}
             </div>
             <div class="kc-resource-actions">

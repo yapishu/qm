@@ -43,6 +43,7 @@ import { type AdminService } from "../admin/admin-service.ts";
 import type { CronStore, CreateCronInput, CronPatch } from "../cron/cron-store.ts";
 import type { WebhookStore, CreateWebhookInput } from "../webhooks/webhook-store.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
+import type { TlonInstallationStore } from "../surfaces/tlon-installation.ts";
 import type {
   ChannelMembership,
   ChannelResolution,
@@ -536,6 +537,7 @@ export interface AppDeps {
   webhooks: WebhookStore;
   deliveries: DeliveryStore;
   directory: DirectoryStore;
+  tlonInstallations?: TlonInstallationStore;
   projects?: ProjectStore;
   deploy: DeployService;
   deploymentLayer?: DeploymentLayerRuntime;

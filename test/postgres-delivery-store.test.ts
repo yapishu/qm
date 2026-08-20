@@ -11,7 +11,35 @@ before(async () => {
   const pg = (await import("pg")).default;
   const p = new pg.Pool({ connectionString: URL });
   await p.query("DROP TABLE IF EXISTS deliveries CASCADE");
+  await p.query("DROP SEQUENCE IF EXISTS deliveries_enqueue_seq_seq");
   await p.end();
+});
+
+test("pg delivery store: migration preserves legacy created-at ordering", { skip }, async () => {
+  const pg = (await import("pg")).default;
+  const pool = new pg.Pool({ connectionString: URL });
+  await pool.query(`CREATE TABLE deliveries(
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    destination JSONB NOT NULL,
+    text TEXT NOT NULL,
+    created_at BIGINT NOT NULL,
+    delivered_at BIGINT
+  )`);
+  await pool.query(
+    `INSERT INTO deliveries(id, idempotency_key, destination, text, created_at, delivered_at)
+     VALUES ('later', 'legacy-later', '{"type":"slack","target":"C1"}', 'later', 200, NULL),
+            ('earlier', 'legacy-earlier', '{"type":"slack","target":"C1"}', 'earlier', 100, NULL)`,
+  );
+  await pool.end();
+  const store = createPostgresDeliveryStore(URL!);
+  const pending = await store.pending("slack");
+  assert.deepEqual(
+    pending.map((delivery) => delivery.id),
+    ["earlier", "later"],
+  );
+  await store.ack("earlier", 300);
+  await store.ack("later", 300);
 });
 
 test("pg delivery store: idempotent enqueue, pending-by-type, ack, get", { skip }, async () => {

@@ -15,12 +15,14 @@ const installation: Installation = {
   ownerShip: "~zod",
   channels: ["chat/~zod/General"],
   respondWithoutMention: false,
+  ownerVerified: true,
+  sharedChannelsEnabled: true,
   version: "1",
 };
 
 const text = (content: unknown): string => String(content);
 
-test("channel messages are principal-bound, owner-only, mention-gated, and threaded", () => {
+test("channel messages preserve raw authors, mentions, and thread identity for core authorization", () => {
   const message = parseChannelMessage(
     installation,
     {
@@ -50,22 +52,32 @@ test("channel messages are principal-bound, owner-only, mention-gated, and threa
     principalId: "alice@example.com",
     messageId: "reply-1",
     senderShip: "~zod",
-    text: "please help",
+    text: "~sampel-palnet please help",
     content: "~sampel-palnet please help",
     kind: "channel",
     target: "chat/~zod/General",
     threadRoot: "root-1",
   });
-  assert.equal(
+  assert.deepEqual(
     parseChannelMessage(
       installation,
       {
-        nest: "chat/~zod/general",
+        nest: "chat/~zod/General",
         response: { post: { id: "2", "r-post": { set: { essay: { author: "~bus", content: "helper hi" } } } } },
       },
       text,
     ),
-    null,
+    {
+      accountId: "support",
+      installationVersion: "1",
+      principalId: "alice@example.com",
+      messageId: "2",
+      senderShip: "~bus",
+      text: "helper hi",
+      content: "helper hi",
+      kind: "channel",
+      target: "chat/~zod/General",
+    },
   );
   assert.deepEqual(
     parseChannelMessage(
@@ -87,7 +99,7 @@ test("channel messages are principal-bound, owner-only, mention-gated, and threa
       principalId: "alice@example.com",
       messageId: "top-level-1",
       senderShip: "~zod",
-      text: "top level",
+      text: "~sampel-palnet top level",
       content: "~sampel-palnet top level",
       kind: "channel",
       target: "chat/~zod/General",

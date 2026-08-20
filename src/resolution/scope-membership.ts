@@ -11,7 +11,16 @@ export interface ManagedGroupDirectory {
   slackChannel?(groupId: string): Promise<{ channelId: string; channelName: string } | undefined>;
 }
 
+export interface ManagedChannelDirectory {
+  recognizes(channelId: string): boolean;
+  membership(channelId: string, principalId: string): Promise<boolean | undefined>;
+  members(channelId: string): Promise<string[] | undefined>;
+  version(channelId: string): Promise<string | undefined>;
+  withVersion<T>(channelId: string, version: string | undefined, fn: () => Promise<T>): Promise<T | undefined>;
+}
+
 export interface ScopeMembershipDeps {
+  managedChannels?: ManagedChannelDirectory;
   managedGroups?: Pick<ManagedGroupDirectory, "recognizes" | "membership" | "members">;
   directory?: {
     channelMember(channelId: string, principalId: string): Promise<boolean>;
@@ -39,6 +48,9 @@ async function currentSharedScopeMember(
   principalId: string,
 ): Promise<boolean> {
   if (!activePrincipal(deps, principalId)) return false;
+  if (kind === "channel" && deps.managedChannels?.recognizes(ref)) {
+    return (await deps.managedChannels.membership(ref, principalId).catch(() => false)) === true;
+  }
   if (kind === "group" && deps.managedGroups?.recognizes(ref)) {
     return (await deps.managedGroups.membership(ref, principalId).catch(() => false)) === true;
   }
@@ -53,6 +65,9 @@ async function sharedScopeMembership(
   principalId: string,
 ): Promise<boolean | undefined> {
   if (!activePrincipal(deps, principalId)) return false;
+  if (kind === "channel" && deps.managedChannels?.recognizes(ref)) {
+    return (await deps.managedChannels.membership(ref, principalId).catch(() => false)) === true;
+  }
   if (kind === "group" && deps.managedGroups?.recognizes(ref)) {
     return (await deps.managedGroups.membership(ref, principalId).catch(() => false)) === true;
   }
@@ -109,6 +124,11 @@ export function createCurrentScopeMembers(deps: ScopeMembershipDeps): CurrentSco
   return async function currentScopeMembers(scope): Promise<Principal[] | undefined> {
     const { kind, ref } = parseScopeId(scope);
     if (kind !== "channel" && kind !== "group") return undefined;
+
+    if (kind === "channel" && deps.managedChannels?.recognizes(ref)) {
+      const memberIds = await deps.managedChannels.members(ref);
+      return (memberIds ?? []).map((id) => principal(id)).filter((member): member is Principal => member !== null);
+    }
 
     if (kind === "group" && deps.managedGroups?.recognizes(ref)) {
       const memberIds = await deps.managedGroups.members(ref);
@@ -172,6 +192,7 @@ export function createMembershipControlsScope(deps: ScopeMembershipDeps): Member
   return async function membershipControlsScope(scope) {
     const { kind, ref } = parseScopeId(scope);
     if (kind === "group") return true;
+    if (kind === "channel" && deps.managedChannels?.recognizes(ref)) return true;
     return kind === "channel" && (await deps.directory?.channelPrivacy?.(ref).catch(() => undefined)) === true;
   };
 }
@@ -183,6 +204,9 @@ export function createCanManageScope(deps: ScopeMembershipDeps): CanManageScope 
     if (kind === "personal") return samePerson(ref, principalId);
     if (kind === "group") return currentSharedScopeMember(deps, kind, ref, principalId);
     if (kind === "channel") {
+      if (deps.managedChannels?.recognizes(ref)) {
+        return currentSharedScopeMember(deps, kind, ref, principalId);
+      }
       const isPrivate = await deps.directory?.channelPrivacy?.(ref).catch(() => undefined);
       if (isPrivate !== true) return false;
       return currentSharedScopeMember(deps, kind, ref, principalId);

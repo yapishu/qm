@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { DeliveryStore } from "../src/delivery/delivery-store.ts";
+import type { Delivery } from "../src/types.ts";
 
 export async function exerciseDeliveryStore(store: DeliveryStore): Promise<void> {
   const d = await store.enqueue({
@@ -199,6 +200,32 @@ export async function exerciseDeliveryStore(store: DeliveryStore): Promise<void>
   assert.equal(runCounts.get("c9"), undefined, "crons with no deliveries stay absent");
   assert.equal((await store.sentRunCountsByCron([])).size, 0);
 
+  const remoteA = await store.enqueue({
+    destination: { type: "tlon", target: "ship-a", queueKey: "room-a" },
+    text: "first remote post",
+    idempotencyKey: "tlon-ref-a",
+  });
+  const remoteB = await store.enqueue({
+    destination: { type: "tlon", target: "ship-b", queueKey: "room-b" },
+    text: "second remote post",
+    idempotencyKey: "tlon-ref-b",
+  });
+  const remoteClaims = await store.claimPending("tlon", 60_000, 10, true);
+  const claimedA = remoteClaims.find((delivery) => delivery.id === remoteA.id)!;
+  const claimedB = remoteClaims.find((delivery) => delivery.id === remoteB.id)!;
+  const refA = await store.reserveConnectorRef(claimedA.id, claimedA.claimToken!);
+  const refB = await store.reserveConnectorRef(claimedB.id, claimedB.claimToken!);
+  assert.equal(Number.isSafeInteger(refA), true);
+  assert.equal(Number.isSafeInteger(refB), true);
+  assert.notEqual(refA, refB, "distinct deliveries reserve collision-free remote references");
+  assert.equal(
+    await store.reserveConnectorRef(claimedA.id, claimedA.claimToken!),
+    refA,
+    "a retried delivery keeps its original remote reference",
+  );
+  await store.ack(remoteA.id, 550);
+  await store.ack(remoteB.id, 550);
+
   const contested = await store.enqueue({
     destination: { type: "group", target: "C-race" },
     text: "enqueued during the deploy overlap",
@@ -289,6 +316,37 @@ export async function exerciseDeliveryStore(store: DeliveryStore): Promise<void>
     [orderedB.id],
   );
   await store.ack(orderedB.id, 900);
+
+  const originalNow = Date.now;
+  let tiedA: Delivery;
+  let tiedB: Delivery;
+  try {
+    Date.now = () => 123_456;
+    tiedA = await store.enqueue({
+      destination: { type: "group", target: "C-tied", queueKey: "account-tied" },
+      text: "first same-millisecond delivery",
+      idempotencyKey: "ordered-tied-1",
+    });
+    tiedB = await store.enqueue({
+      destination: { type: "group", target: "C-tied", queueKey: "account-tied" },
+      text: "second same-millisecond delivery",
+      idempotencyKey: "ordered-tied-2",
+    });
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.equal(tiedA.createdAt, tiedB.createdAt);
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1, true)).map((delivery) => delivery.id),
+    [tiedA.id],
+    "durable enqueue order breaks timestamp ties",
+  );
+  await store.ack(tiedA.id, 950);
+  assert.deepEqual(
+    (await store.claimPending("group", 60_000, 1, true)).map((delivery) => delivery.id),
+    [tiedB.id],
+  );
+  await store.ack(tiedB.id, 950);
 
   const releasable = await store.enqueue({
     destination: { type: "group", target: "C-release", queueKey: "account-release" },

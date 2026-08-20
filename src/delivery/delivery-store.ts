@@ -13,6 +13,7 @@ export interface DeliveryStore {
   }): Promise<Delivery>;
   pending(type: string): Promise<Delivery[]>;
   claimPending(type: string, ttlMs: number, limit?: number, grouped?: boolean): Promise<Delivery[]>;
+  reserveConnectorRef(id: string, claimToken: string): Promise<number | null>;
   releaseClaim(id: string, claimToken: string): Promise<boolean>;
   listShadow(opts?: { limit?: number }): Promise<Delivery[]>;
   ack(id: string, at: number, slackApiMs?: number): Promise<void>;
@@ -33,6 +34,8 @@ export function createDeliveryStore(): DeliveryStore {
   const claimedUntil = new Map<string, number>();
   const claimTokens = new Map<string, string>();
   const enqueueListeners = new Set<() => void>();
+  let connectorClock = Date.now();
+  let enqueueSeq = 0;
 
   return {
     async enqueue(input) {
@@ -40,6 +43,7 @@ export function createDeliveryStore(): DeliveryStore {
       if (existingId) return deliveries.get(existingId)!;
       const delivery: Delivery = {
         id: randomUUID(),
+        enqueueSeq: ++enqueueSeq,
         destination: input.destination,
         text: input.text,
         ...(input.attachments?.length ? { attachments: input.attachments } : {}),
@@ -63,7 +67,7 @@ export function createDeliveryStore(): DeliveryStore {
         typeof limit === "number" && Number.isInteger(limit) && limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
       const pending = [...deliveries.values()]
         .filter((d) => d.deliveredAt === null && !d.shadow && d.destination.type === type)
-        .sort((a, b) => a.createdAt - b.createdAt);
+        .sort((a, b) => a.enqueueSeq! - b.enqueueSeq!);
       const candidates = grouped
         ? [
             ...pending
@@ -88,6 +92,14 @@ export function createDeliveryStore(): DeliveryStore {
       claimTokens.delete(id);
       claimedUntil.delete(id);
       return true;
+    },
+    async reserveConnectorRef(id, claimToken) {
+      const delivery = deliveries.get(id);
+      if (!delivery || claimTokens.get(id) !== claimToken) return null;
+      if (delivery.connectorRef !== undefined) return delivery.connectorRef;
+      connectorClock = Math.max(connectorClock + 1, Date.now());
+      delivery.connectorRef = connectorClock;
+      return connectorClock;
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);
@@ -119,6 +131,7 @@ export function createDeliveryStore(): DeliveryStore {
       }
       const tombstone: Delivery = {
         id: randomUUID(),
+        enqueueSeq: ++enqueueSeq,
         destination: { type: "ack-tombstone", target: "" },
         text: "",
         idempotencyKey,

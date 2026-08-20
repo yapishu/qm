@@ -4,6 +4,7 @@ import { audit, isObj } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
 import {
   TlonInstallationBusyError,
+  tlonChannelRef,
   type TlonConnectionInput,
   type TlonInboundMessage,
   type TlonRuntimeStatus,
@@ -17,6 +18,7 @@ interface TlonRunTarget {
   accountId: string;
   accountVersion: string;
   conversationId: string;
+  kind: "dm" | "channel";
 }
 
 function tlonRunTarget(run: Run): TlonRunTarget | null {
@@ -33,7 +35,12 @@ function tlonRunTarget(run: Run): TlonRunTarget | null {
       typeof target.target !== "string"
     )
       return null;
-    return { accountId: target.accountId, accountVersion: target.accountVersion, conversationId: target.target };
+    return {
+      accountId: target.accountId,
+      accountVersion: target.accountVersion,
+      conversationId: target.target,
+      kind: target.kind,
+    };
   } catch {
     return null;
   }
@@ -69,7 +76,14 @@ async function presenceRun(ctx: ApiCtx, run: Run, target: TlonRunTarget): Promis
     conversationId: target.conversationId,
     status: run.status,
     activeTools: activePresenceTools(activity ?? []),
+    ...(target.kind === "channel" && run.request.scopeVersion ? { scopeVersion: run.request.scopeVersion } : {}),
   };
+}
+
+async function runRosterIsCurrent(ctx: ApiCtx, run: Run, target: TlonRunTarget): Promise<boolean> {
+  if (target.kind === "dm") return true;
+  const version = await ctx.deps.tlonInstallations?.version(tlonChannelRef(target.conversationId));
+  return !!version && run.request.scopeVersion === version;
 }
 
 function principal(ctx: ApiCtx): string {
@@ -205,6 +219,12 @@ async function reportRuntimeStatus(ctx: ApiCtx): Promise<void> {
   const version = typeof ctx.body.version === "string" ? ctx.body.version : "";
   const status = typeof ctx.body.status === "string" ? ctx.body.status : "";
   const message = typeof ctx.body.message === "string" ? ctx.body.message : undefined;
+  const verifiedChannels = Array.isArray(ctx.body.verifiedChannels)
+    ? ctx.body.verifiedChannels.filter((value): value is string => typeof value === "string")
+    : undefined;
+  if (Array.isArray(ctx.body.verifiedChannels) && verifiedChannels?.length !== ctx.body.verifiedChannels.length) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "verifiedChannels must contain strings" });
+  }
   if (!version || !RUNTIME_STATUSES.has(status as TlonRuntimeStatus)) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "version and valid status required" });
   }
@@ -212,6 +232,7 @@ async function reportRuntimeStatus(ctx: ApiCtx): Promise<void> {
     version,
     status: status as TlonRuntimeStatus,
     ...(message ? { message } : {}),
+    ...(verifiedChannels ? { verifiedChannels } : {}),
   });
   return updated ? sendJson(ctx.res, 200, { ok: true }) : sendJson(ctx.res, 409, { error: "stale_installation" });
 }
@@ -222,7 +243,9 @@ async function acquireOperationLease(ctx: ApiCtx): Promise<void> {
   if (!isObj(ctx.body) || typeof ctx.body.version !== "string") {
     return sendJson(ctx.res, 400, { error: "bad_request" });
   }
-  const token = await store.acquire(ctx.params.id ?? "", ctx.body.version, 120_000);
+  const channel = typeof ctx.body.channel === "string" ? ctx.body.channel : undefined;
+  const scopeVersion = typeof ctx.body.scopeVersion === "string" ? ctx.body.scopeVersion : undefined;
+  const token = await store.acquire(ctx.params.id ?? "", ctx.body.version, 120_000, channel, scopeVersion);
   return sendJson(ctx.res, 200, { token });
 }
 
@@ -279,6 +302,15 @@ async function releaseInbound(ctx: ApiCtx): Promise<void> {
     : sendJson(ctx.res, 404, { error: "not_found" });
 }
 
+async function channelScopeIsCurrent(ctx: ApiCtx): Promise<void> {
+  const store = ctx.deps.tlonInstallations;
+  if (!store) return sendJson(ctx.res, 404, { error: "not_configured" });
+  const channel = ctx.url.searchParams.get("channel") ?? "";
+  const scopeVersion = ctx.url.searchParams.get("scopeVersion") ?? "";
+  if (!channel || !scopeVersion) return sendJson(ctx.res, 400, { error: "bad_request" });
+  return sendJson(ctx.res, 200, { current: (await store.version(tlonChannelRef(channel))) === scopeVersion });
+}
+
 async function listRunPresence(ctx: ApiCtx): Promise<void> {
   if (!ctx.deps.tlonInstallations || !ctx.deps.runs || !ctx.deps.runActivity) {
     return sendJson(ctx.res, 404, { error: "not_configured" });
@@ -291,11 +323,11 @@ async function listRunPresence(ctx: ApiCtx): Promise<void> {
     runs.flatMap((run) => {
       const target = tlonRunTarget(run);
       return target && installationVersions.get(target.accountId) === target.accountVersion
-        ? [presenceRun(ctx, run, target)]
+        ? [runRosterIsCurrent(ctx, run, target).then((current) => (current ? presenceRun(ctx, run, target) : null))]
         : [];
     }),
   );
-  return sendJson(ctx.res, 200, { runs: snapshots });
+  return sendJson(ctx.res, 200, { runs: snapshots.filter((snapshot) => snapshot !== null) });
 }
 
 async function getRunPresence(ctx: ApiCtx): Promise<void> {
@@ -312,14 +344,17 @@ async function getRunPresence(ctx: ApiCtx): Promise<void> {
   if (!run || !target || target.accountId !== accountId || target.accountVersion !== version) {
     return sendJson(ctx.res, 404, { error: "not_found" });
   }
+  if (!(await runRosterIsCurrent(ctx, run, target))) {
+    return sendJson(ctx.res, 409, { error: "stale_roster" });
+  }
   return sendJson(ctx.res, 200, await presenceRun(ctx, run, target));
 }
 
 export const tlonInstallationRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "GET", path: "/v1/tlon/connections", auth: "either", handle: listConnections },
-  { method: "POST", path: "/v1/tlon/connections", auth: "either", handle: createConnection },
-  { method: "PUT", path: "/v1/tlon/connections/:id", auth: "either", handle: updateConnection },
-  { method: "DELETE", path: "/v1/tlon/connections/:id", auth: "either", handle: deleteConnection },
+  { method: "GET", path: "/v1/tlon/connections", auth: "source", handle: listConnections },
+  { method: "POST", path: "/v1/tlon/connections", auth: "source", handle: createConnection },
+  { method: "PUT", path: "/v1/tlon/connections/:id", auth: "source", handle: updateConnection },
+  { method: "DELETE", path: "/v1/tlon/connections/:id", auth: "source", handle: deleteConnection },
   { method: "GET", path: "/v1/tlon/installations", auth: "source", handle: listRuntimeInstallations },
   { method: "POST", path: "/v1/tlon/installations/:id/status", auth: "source", handle: reportRuntimeStatus },
   { method: "POST", path: "/v1/tlon/installations/:id/lease", auth: "source", handle: acquireOperationLease },
@@ -328,6 +363,7 @@ export const tlonInstallationRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/tlon/inbound", auth: "source", handle: claimInbound },
   { method: "POST", path: "/v1/tlon/inbound/:id/ack", auth: "source", handle: ackInbound },
   { method: "POST", path: "/v1/tlon/inbound/:id/release", auth: "source", handle: releaseInbound },
+  { method: "GET", path: "/v1/tlon/channel-scope", auth: "source", handle: channelScopeIsCurrent },
   { method: "GET", path: "/v1/tlon/presence/runs", auth: "source", handle: listRunPresence },
   { method: "GET", path: "/v1/tlon/presence/runs/:accountId/:runId", auth: "source", handle: getRunPresence },
 ];

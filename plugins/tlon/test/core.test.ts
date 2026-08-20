@@ -23,7 +23,8 @@ test("top-level Tlon turns share a timeline and only explicit replies create thr
     return Response.json({ status: "queued", runId: `run-${bodies.length}` }, { status: 202 });
   }) as typeof fetch);
 
-  assert.equal(conversationThreadRef(topLevel), "tlon:support:channel:chat/~zod/General");
+  assert.equal(conversationThreadRef(topLevel), "tlon:channel:chat%2F~zod%2FGeneral");
+  assert.equal(conversationThreadRef({ ...topLevel, accountId: "sales" }), conversationThreadRef(topLevel));
   assert.deepEqual(await client.turn(topLevel), { runId: "run-1" });
   assert.deepEqual(await client.turn({ ...topLevel, messageId: "message-2", threadRoot: "root-1" }), {
     runId: "run-2",
@@ -32,7 +33,7 @@ test("top-level Tlon turns share a timeline and only explicit replies create thr
 
   const first = bodies[0] as {
     deliveryTarget: string;
-    conversation: { threadRef: string };
+    conversation: { threadRef: string; channelRef: string; isPrivate: boolean };
   };
   const second = bodies[1] as {
     deliveryTarget: string;
@@ -45,7 +46,9 @@ test("top-level Tlon turns share a timeline and only explicit replies create thr
     kind: "channel",
     target: "chat/~zod/General",
   });
-  assert.equal(first.conversation.threadRef, "tlon:support:channel:chat/~zod/General");
+  assert.equal(first.conversation.threadRef, "tlon:channel:chat%2F~zod%2FGeneral");
+  assert.equal(first.conversation.channelRef, "tlon:chat%2F~zod%2FGeneral");
+  assert.equal(first.conversation.isPrivate, true);
   assert.deepEqual(decodeDeliveryTarget(second.deliveryTarget), {
     accountId: "support",
     accountVersion: "1",
@@ -53,9 +56,28 @@ test("top-level Tlon turns share a timeline and only explicit replies create thr
     target: "chat/~zod/General",
     replyTo: "root-1",
   });
-  assert.equal(second.conversation.threadRef, "tlon:support:channel:chat/~zod/General:thread:root-1");
-  assert.equal((bodies[0] as { idempotencyKey: string }).idempotencyKey, "tlon:support:1:message-1");
-  assert.equal(third.idempotencyKey, "tlon:support:2:message-1");
+  assert.equal(second.conversation.threadRef, "tlon:channel:chat%2F~zod%2FGeneral:thread:root-1");
+  assert.equal((bodies[0] as { deliveryQueueKey: string }).deliveryQueueKey, "tlon:channel:chat%2F~zod%2FGeneral");
+  assert.equal(
+    (bodies[0] as { idempotencyKey: string }).idempotencyKey,
+    "tlon:channel:chat%2F~zod%2FGeneral:~zod:message-1",
+  );
+  assert.equal(third.idempotencyKey, "tlon:channel:chat%2F~zod%2FGeneral:~zod:message-1");
+});
+
+test("connection reports include the ship-verified channel set", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new CoreClient("http://core:8080", undefined, (async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({ ok: true });
+  }) as typeof fetch);
+
+  await client.report("account", "version", "connected", undefined, ["chat/~zod/general"]);
+  assert.deepEqual(body, {
+    version: "version",
+    status: "connected",
+    verifiedChannels: ["chat/~zod/general"],
+  });
 });
 
 test("presence reads use the narrow Tlon runtime endpoints", async () => {
@@ -77,6 +99,23 @@ test("presence reads use the narrow Tlon runtime endpoints", async () => {
   assert.deepEqual(await client.presenceRuns(), [snapshot]);
   assert.deepEqual(await client.run("account/one", "run/1"), snapshot);
   assert.deepEqual(paths, ["/v1/tlon/presence/runs", "/v1/tlon/presence/runs/account%2Fone/run%2F1"]);
+
+  const stale = new CoreClient("http://core:8080", undefined, (async () =>
+    Response.json({ error: "stale_roster" }, { status: 409 })) as typeof fetch);
+  assert.equal(await stale.run("account/one", "run/1"), null);
+});
+
+test("shared-room scope checks use the narrow source-auth endpoint", async () => {
+  let path = "";
+  const client = new CoreClient("http://core:8080", undefined, (async (input) => {
+    path = String(input);
+    return Response.json({ current: true });
+  }) as typeof fetch);
+  assert.equal(await client.channelScopeIsCurrent("chat/~zod/general", "roster-1"), true);
+  const url = new URL(path);
+  assert.equal(url.pathname, "/v1/tlon/channel-scope");
+  assert.equal(url.searchParams.get("channel"), "chat/~zod/general");
+  assert.equal(url.searchParams.get("scopeVersion"), "roster-1");
 });
 
 test("Tlon turns carry staged attachments and connector notices into core", async () => {
@@ -93,14 +132,27 @@ test("Tlon turns carry staged attachments and connector notices into core", asyn
     sourceId: "tlon:message-1:0",
     author: "~zod",
   };
-  await client.turn({ ...topLevel, attachments: [attachment], inboundNotes: ["one file was unavailable"] });
+  const externalPromptData = [{ source: "tlon-citation:1", content: "untrusted cited text" }];
+  await client.turn({
+    ...topLevel,
+    attachments: [attachment],
+    inboundNotes: ["one file was unavailable"],
+    externalPromptData,
+  });
   assert.deepEqual(body.attachments, [attachment]);
   assert.deepEqual(body.inboundNotes, ["one file was unavailable"]);
+  assert.deepEqual(body.externalPromptData, externalPromptData);
 });
 
 test("raw inbound messages and bounded delivery claims use the durable connector queues", async () => {
   const calls: Array<{ path: string; method: string; body: unknown }> = [];
-  const record = { id: "inbound-1", message: topLevel, createdAt: 1, claimToken: "claim-1" };
+  const record = {
+    id: "inbound-1",
+    queueKey: "channel:chat/~zod/General",
+    message: { ...topLevel, scopeVersion: "scope-1" },
+    createdAt: 1,
+    claimToken: "claim-1",
+  };
   const client = new CoreClient("http://core:8080", undefined, (async (input, init) => {
     const url = new URL(String(input));
     const body = init?.body ? (JSON.parse(String(init.body)) as unknown) : undefined;

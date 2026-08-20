@@ -33,10 +33,6 @@ function hasRichPayload(content: { content: unknown; blob?: string }): boolean {
   return Boolean(content.blob) || (Array.isArray(content.content) && content.content.length > 0);
 }
 
-function allowed(installation: Installation, sender: string): boolean {
-  return sender === installation.ownerShip;
-}
-
 function writ(value: unknown, fallbackAuthor: string): { id: string; author: string } {
   const raw = String(value ?? "");
   const slash = raw.indexOf("/");
@@ -49,14 +45,6 @@ function channelNest(value: unknown): string {
   const parts = value.trim().split("/");
   if (parts.length !== 3) return "";
   return `${parts[0]!.toLowerCase()}/${ship(parts[1])}/${parts[2]}`;
-}
-
-function mentionText(installation: Installation, text: string): string | null {
-  if (installation.respondWithoutMention) return text.trim();
-  const mentions = [installation.ship, installation.ship.slice(1)];
-  const matched = mentions.find((mention) => text.toLowerCase().includes(mention.toLowerCase()));
-  if (!matched) return null;
-  return text.replace(new RegExp(matched.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "").trim();
 }
 
 export function parseChannelMessage(
@@ -75,10 +63,9 @@ export function parseChannelMessage(
   const replySet = record(replyResponse?.set);
   const postSet = record(postResponse?.set);
   const content = essay(replySet?.["reply-essay"] ?? postSet?.essay);
-  if (!content || content.author === installation.ship || !allowed(installation, content.author)) return null;
-  const rawText = toText(content.content).trim();
-  const text = mentionText(installation, rawText);
-  if (text === null || (!text && !hasRichPayload(content))) return null;
+  if (!content || content.author === installation.ship) return null;
+  const text = toText(content.content).trim();
+  if (!text && !hasRichPayload(content)) return null;
   const messageId = String(reply?.id ?? post?.id ?? "");
   if (!messageId) return null;
   const seal = record(replySet?.seal);
@@ -115,8 +102,8 @@ export function parseDmMessage(installation: Installation, value: unknown, toTex
     !content ||
     !partner ||
     content.author === installation.ship ||
-    !allowed(installation, partner) ||
-    !allowed(installation, content.author)
+    partner !== installation.ownerShip ||
+    content.author !== installation.ownerShip
   )
     return null;
   const text = toText(content.content).trim();
@@ -141,5 +128,5 @@ export function parseDmMessage(installation: Installation, value: unknown, toTex
 
 export function dmInvites(installation: Installation, value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return value.map((entry) => ship(record(entry)?.ship)).filter((sender) => sender && allowed(installation, sender));
+  return value.map((entry) => ship(record(entry)?.ship)).filter((sender) => sender === installation.ownerShip);
 }

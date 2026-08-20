@@ -225,10 +225,18 @@ export function createMessagingMethods(
     setWebhookRecipientConsent(id, recipientConsent) {
       return deps.webhooks.setRecipientConsent(id, recipientConsent);
     },
-    pendingDeliveries(type, claimMs, limit, grouped) {
-      return claimMs && claimMs > 0
-        ? deps.deliveries.claimPending(type, claimMs, limit, grouped)
-        : deps.deliveries.pending(type);
+    async pendingDeliveries(type, claimMs, limit, grouped) {
+      if (!claimMs || claimMs <= 0) return deps.deliveries.pending(type);
+      const claimed = await deps.deliveries.claimPending(type, claimMs, limit, grouped);
+      if (type !== "tlon") return claimed;
+      return Promise.all(
+        claimed.map(async (delivery) => {
+          if (!delivery.claimToken) throw new Error(`delivery ${delivery.id} was returned without a claim`);
+          const connectorRef = await deps.deliveries.reserveConnectorRef(delivery.id, delivery.claimToken);
+          if (connectorRef === null) throw new Error(`delivery ${delivery.id} lost its claim before routing`);
+          return { ...delivery, connectorRef };
+        }),
+      );
     },
     releaseDeliveryClaim(id, claimToken) {
       return deps.deliveries.releaseClaim(id, claimToken);

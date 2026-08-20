@@ -481,12 +481,6 @@ export function buildApp(
     artifactMap("slack_installation"),
     config.connectorSecretKey ?? randomBytes(32),
   );
-  const tlonInstallations = createTlonInstallationStore(
-    config.orgId,
-    artifactMap("tlon_installations"),
-    config.connectorSecretKey ?? randomBytes(32),
-    artifactMap("tlon_inbound"),
-  );
   const deploymentLayer = config.deploymentLayerDir
     ? loadDeploymentLayer(config.deploymentLayerDir)
     : emptyDeploymentLayer();
@@ -725,6 +719,29 @@ export function buildApp(
     config.sessionStore === "postgres"
       ? createPostgresSessionStore(requireDbUrl("SESSION_STORE"))
       : createMemorySessionStore();
+  const tlonInstallations = createTlonInstallationStore(
+    config.orgId,
+    artifactMap("tlon_installations"),
+    config.connectorSecretKey ?? randomBytes(32),
+    artifactMap("tlon_inbound"),
+    advisoryLock,
+    async (channelId, _previous, current) => {
+      const currentSet = new Set(current);
+      const affected = (await sessions.listAll()).filter(
+        (session) => session.scopeId === scopeId("channel", channelId),
+      );
+      for (const session of affected) {
+        for (const principalId of await sessions.participantsOf(session.id)) {
+          if (!currentSet.has(principalId)) await sessions.removeParticipant(session.id, principalId);
+        }
+        for (const principalId of current) {
+          await sessions.addParticipant(session.id, principalId, undefined, { includeHistory: false });
+        }
+      }
+    },
+    (principalId) => identity.isInternal(identity.classify(principalId)),
+    () => identity.refresh(true),
+  );
   const runStoreKind = config.runStore;
   const runSignals: RunSignalStore =
     runStoreKind === "postgres"
@@ -917,11 +934,36 @@ export function buildApp(
     isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
     advisoryLock,
   });
-  const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, sessions });
-  const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity });
-  const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
-  const managesArtifactHome = createManagesArtifactHome({ managedGroups: projects, directory }, canManageScope);
-  const currentScopeMembers = createCurrentScopeMembers({ managedGroups: projects, directory, identity });
+  const canReadScope = createCanReadScope({
+    managedChannels: tlonInstallations,
+    managedGroups: projects,
+    directory,
+    identity,
+    sessions,
+  });
+  const canWriteScope = createCanWriteScope({
+    managedChannels: tlonInstallations,
+    managedGroups: projects,
+    directory,
+    identity,
+  });
+  const canManageScope = createCanManageScope({
+    managedChannels: tlonInstallations,
+    managedGroups: projects,
+    directory,
+    identity,
+    sessions,
+  });
+  const managesArtifactHome = createManagesArtifactHome(
+    { managedChannels: tlonInstallations, managedGroups: projects, directory },
+    canManageScope,
+  );
+  const currentScopeMembers = createCurrentScopeMembers({
+    managedChannels: tlonInstallations,
+    managedGroups: projects,
+    directory,
+    identity,
+  });
   membership.canReadScope = canReadScope;
   membership.canManageScope = canManageScope;
   membership.managesArtifactHome = managesArtifactHome;
@@ -1059,6 +1101,7 @@ export function buildApp(
     ...(config.sharedOwnerAuthIsolation ? { ownerAuthExec: true, sharedOwnerAuthIsolation: true } : {}),
     directory,
     managedGroups: projects,
+    managedChannels: tlonInstallations,
     ...(config.reachExecEnabled ? { reachExec: true } : {}),
     ...(config.surfaceDebugFooter ? { surfaceDebugFooter: true } : {}),
     ...(config.eagerProvisionEnabled ? { eagerProvision: true } : {}),
@@ -1180,6 +1223,7 @@ export function buildApp(
     webhooks,
     deliveries,
     directory,
+    tlonInstallations,
     projects,
     environments,
     deploy: deployService,

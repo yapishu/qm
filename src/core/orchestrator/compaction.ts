@@ -67,9 +67,10 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
     );
     return summary ? [summary, ...kept] : kept;
   };
-  const isManagedGroupScope = (scope: string): boolean => {
+  const isManagedRosterScope = (scope: string): boolean => {
     const parsed = parseScopeId(scope);
-    return parsed.kind === "group" && deps.managedGroups?.recognizes(parsed.ref) === true;
+    if (parsed.kind === "group") return deps.managedGroups?.recognizes(parsed.ref) === true;
+    return parsed.kind === "channel" && deps.managedChannels?.recognizes(parsed.ref) === true;
   };
 
   const keepRecentEntries = Math.max(1, Math.floor(maxContextEntries * COMPACT_SOFT_FRACTION) - 1);
@@ -83,7 +84,7 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
     actorId: string;
     model?: string;
   }): Promise<Summarized | null> {
-    if (isManagedGroupScope(input.scopeId)) return null;
+    if (isManagedRosterScope(input.scopeId)) return null;
     if (!deps.harness.models.compactHistory) return null;
     const maxContextTokens = tokenBudgetFor(input.scopeId, input.model);
     const reuseBudget = {

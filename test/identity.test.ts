@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createIdentityService, type DeactivationRecord } from "../src/identity/identity-service.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import { createMemoryMap, type DurableMap } from "../src/persistence/durable-map.ts";
 
 const id = createIdentityService();
 
@@ -91,6 +91,35 @@ test("a running instance refreshes deactivations written by another instance", a
   assert.equal(reader.classify("U-leaver").type, "internal");
   await reader.refresh();
   assert.equal(reader.classify("U-leaver").type, "guest");
+});
+
+test("a stale refresh snapshot cannot overwrite a concurrent local identity mutation", async () => {
+  const durable = createMemoryMap<DeactivationRecord>();
+  let snapshotTaken = (): void => {};
+  const taken = new Promise<void>((resolve) => {
+    snapshotTaken = resolve;
+  });
+  let releaseSnapshot = (): void => {};
+  const release = new Promise<void>((resolve) => {
+    releaseSnapshot = resolve;
+  });
+  const backing: DurableMap<DeactivationRecord> = {
+    ...durable,
+    async all() {
+      const snapshot = await durable.all();
+      snapshotTaken();
+      await release;
+      return snapshot;
+    },
+  };
+  const svc = createIdentityService(backing);
+  const refresh = svc.refresh(true);
+  await taken;
+  await svc.deactivate("U-leaver");
+  releaseSnapshot();
+  await refresh;
+  assert.equal(svc.classify("U-leaver").type, "guest");
+  assert.equal((await durable.get("U-leaver"))?.principalId, "U-leaver");
 });
 
 test("a directory sync deactivates dropped members and self-heals when they reappear", async () => {

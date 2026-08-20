@@ -49,6 +49,13 @@ test("runResultDelivery maps ok-with-reply to a recovery delivery keyed by run",
   });
 });
 
+test("runResultDelivery preserves the Tlon shared-room roster epoch", () => {
+  const recovered = run({
+    request: { ...turn("hi", "tlon-target"), surface: "tlon", scopeVersion: "roster-1" },
+  });
+  assert.equal(runResultDelivery(recovered)?.destination.scopeVersion, "roster-1");
+});
+
 test("runResultDelivery carries the reply's attachments so recovery can replay the files", () => {
   const atts = [{ name: "report.csv", mimetype: "text/csv", sizeBytes: 42, blobId: "blob-1" }];
   const d = runResultDelivery(run({ result: { status: "ok", reply: "here's the file", attachments: atts } }));

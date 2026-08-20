@@ -13,6 +13,8 @@ const installation: Installation = {
   ownerShip: "~zod",
   channels: [],
   respondWithoutMention: false,
+  ownerVerified: true,
+  sharedChannelsEnabled: true,
   version: "1",
 };
 

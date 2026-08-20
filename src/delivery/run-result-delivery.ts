@@ -22,6 +22,7 @@ export function runResultDelivery(run: Run, taskList: Task[] = []): RunResultDel
     type: surface,
     target,
     ...(run.request.deliveryQueueKey ? { queueKey: run.request.deliveryQueueKey } : {}),
+    ...(surface === "tlon" && run.request.scopeVersion ? { scopeVersion: run.request.scopeVersion } : {}),
     ...(editRef ? { editRef } : {}),
     ...(taskList.length ? { taskList: taskList.map(({ id, title, status }) => ({ id, title, status })) } : {}),
   };

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { TlonController } from "../src/controller.ts";
 import type { CoreClient } from "../src/core.ts";
-import { parseDmMessage } from "../src/messages.ts";
+import { parseChannelMessage, parseDmMessage } from "../src/messages.ts";
 import { encodeDeliveryTarget } from "../src/target.ts";
 import { TlonConnection } from "../src/tlon.ts";
 import type { Delivery, InboundMessage, Installation } from "../src/types.ts";
@@ -17,6 +17,8 @@ const installation: Installation = {
   ownerShip: "~zod",
   channels: [],
   respondWithoutMention: false,
+  ownerVerified: true,
+  sharedChannelsEnabled: true,
   version: "1",
 };
 
@@ -173,6 +175,37 @@ test("stopping during startup closes the Airlock client and pinned transport", a
   assert.equal(closed, 1);
 });
 
+test("connected ships authorize only configured channels they have actually joined", async () => {
+  let reads = 0;
+  const client = { nodeId: installation.ship } as Urbit;
+  const connection = new TlonConnection(
+    { ...installation, channels: ["chat/~host/allowed", "chat/~host/missing"] },
+    async () => {},
+    {
+      listGroups: async () => {
+        reads++;
+        return [
+          {
+            id: "~host/group",
+            currentUserIsMember: true,
+            currentUserIsHost: false,
+            hostUserId: "~host",
+            channels: [
+              { id: "chat/~host/allowed", type: "chat", currentUserIsMember: true },
+              { id: "chat/~host/restricted", type: "chat", currentUserIsMember: false },
+            ],
+          },
+        ];
+      },
+    },
+  );
+  (connection as unknown as { client: Urbit }).client = client;
+
+  assert.deepEqual(await connection.verifiedChannels(), ["chat/~host/allowed"]);
+  assert.deepEqual(await connection.verifiedChannels(), ["chat/~host/allowed"]);
+  assert.equal(reads, 1);
+});
+
 test("stopping before transport creation finishes never submits the login code", async () => {
   let resolveTransport = (_transport: { fetch: typeof fetch; close: () => Promise<void> }): void => {};
   const transportCreated = new Promise<{
@@ -306,6 +339,7 @@ test("outbound Markdown is delivered as native Tlon rich text", async () => {
     text: "# Result\n\n**bold** and `code`\n\n- first\n- second",
     idempotencyKey: "run:markdown",
     createdAt: 1,
+    connectorRef: 1_000_001,
   });
 
   const wire = JSON.stringify(pokes[0]!.json);
@@ -314,6 +348,170 @@ test("outbound Markdown is delivered as native Tlon rich text", async () => {
   assert.match(wire, /"inline-code":"code"/);
   assert.match(wire, /"listing":\{"list":\{"type":"unordered"/);
   assert.doesNotMatch(wire, /\*\*bold\*\*/);
+});
+
+test("concurrent deliveries keep independent authenticated request cancellation", async () => {
+  const alpha = "chat/~sampel-palnet/alpha";
+  const beta = "chat/~sampel-palnet/beta";
+  let releaseAlpha = (): void => {};
+  const alphaGate = new Promise<void>((resolve) => {
+    releaseAlpha = resolve;
+  });
+  let alphaFetchStarted = (): void => {};
+  const alphaFetch = new Promise<void>((resolve) => {
+    alphaFetchStarted = resolve;
+  });
+  const transportFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith("/~/login")) {
+      return new Response(null, {
+        status: 204,
+        headers: { "set-cookie": "urbauth-~sampel-palnet=session-secret; Path=/; HttpOnly" },
+      });
+    }
+    if (String(input).endsWith("/alpha")) {
+      alphaFetchStarted();
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    }
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  const connection = new TlonConnection({ ...installation, channels: [alpha, beta] }, async () => {}, {
+    postExists: async () => false,
+    createTransport: async () => ({ fetch: transportFetch, close: async () => {} }),
+    createClient: (_url, authenticatedFetch) => {
+      const client = {
+        nodeId: installation.ship,
+        on: () => client,
+        eventSource: async () => {},
+        subscribe: async () => 1,
+        delete: async () => {},
+        poke: async (poke: { app: string; json: unknown }) => {
+          if (poke.app === "hood") return;
+          const wire = JSON.stringify(poke.json);
+          const channel = wire.includes("/alpha") ? alpha : beta;
+          if (channel === alpha) await alphaGate;
+          const response = await authenticatedFetch(`${installation.url}/${channel.split("/").at(-1)}`);
+          if (!response.ok) throw new Error(`poke failed with HTTP ${response.status}`);
+        },
+      };
+      return client as unknown as Urbit;
+    },
+  });
+  await connection.start();
+  const delivery = (id: string, target: string): Delivery => ({
+    id,
+    destination: {
+      type: "tlon",
+      scopeVersion: "roster-1",
+      target: encodeDeliveryTarget({
+        accountId: installation.id,
+        accountVersion: installation.version,
+        kind: "channel",
+        target,
+      }),
+    },
+    text: id,
+    idempotencyKey: `delivery:${id}`,
+    createdAt: 1,
+    connectorRef: id === "alpha" ? 1_000_002 : 1_000_003,
+  });
+  const alphaAbort = new AbortController();
+  const alphaDelivery = connection.deliver(delivery("alpha", alpha), alphaAbort.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  await connection.deliver(delivery("beta", beta));
+  releaseAlpha();
+  await alphaFetch;
+  alphaAbort.abort(new Error("alpha canceled"));
+  await Promise.race([
+    assert.rejects(alphaDelivery, /alpha canceled/),
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("alpha request did not inherit its cancellation signal")), 100),
+    ),
+  ]);
+  await connection.stop();
+});
+
+test("a reply accepted before a lost response is reconciled instead of duplicated", async () => {
+  let remoteReply = false;
+  let pokes = 0;
+  const client = {
+    nodeId: installation.ship,
+    on: () => client,
+    poke: async () => {
+      pokes++;
+      remoteReply = true;
+      throw new Error("response lost after acceptance");
+    },
+  } as unknown as Urbit;
+  const connection = new TlonConnection(installation, async () => {}, {
+    replyExists: async (_target, sentAt) => remoteReply && sentAt === 1_000_012,
+  });
+  (connection as unknown as { client: Urbit | null }).client = client;
+  const delivery: Delivery = {
+    id: "reply-retry",
+    destination: {
+      type: "tlon",
+      scopeVersion: "roster-1",
+      target: encodeDeliveryTarget({
+        accountId: installation.id,
+        accountVersion: installation.version,
+        kind: "channel",
+        target: "chat/~sampel-palnet/general",
+        replyTo: "parent-post",
+        parentAuthor: "~zod",
+      }),
+    },
+    text: "one reply",
+    idempotencyKey: "delivery:reply-retry",
+    createdAt: 1_000_000,
+    connectorRef: 1_000_012,
+  };
+  await assert.rejects(connection.deliver(delivery), /response lost after acceptance/);
+  await connection.deliver(delivery);
+  assert.equal(pokes, 1);
+});
+
+test("a top-level post accepted before a lost response is reconciled across bot ships", async () => {
+  let remoteDeliveryId: string | undefined;
+  let pokes = 0;
+  const client = {
+    nodeId: installation.ship,
+    on: () => client,
+    poke: async (poke: { json: unknown }) => {
+      pokes++;
+      const wire = JSON.stringify(poke.json);
+      if (wire.includes("qm-delivery") && wire.includes("top-level-retry")) {
+        remoteDeliveryId = "top-level-retry";
+      }
+      throw new Error("response lost after acceptance");
+    },
+  } as unknown as Urbit;
+  const connection = new TlonConnection(installation, async () => {}, {
+    postExists: async (_target, deliveryId) => remoteDeliveryId === deliveryId,
+  });
+  (connection as unknown as { client: Urbit | null }).client = client;
+  const delivery: Delivery = {
+    id: "top-level-retry",
+    destination: {
+      type: "tlon",
+      scopeVersion: "roster-1",
+      target: encodeDeliveryTarget({
+        accountId: installation.id,
+        accountVersion: installation.version,
+        kind: "channel",
+        target: "chat/~sampel-palnet/general",
+      }),
+    },
+    text: "one post",
+    idempotencyKey: "delivery:top-level-retry",
+    createdAt: 1_000_000,
+    connectorRef: 1_000_014,
+  };
+  await assert.rejects(connection.deliver(delivery), /response lost after acceptance/);
+  assert.equal(remoteDeliveryId, delivery.id);
+  await connection.deliver(delivery);
+  assert.equal(pokes, 1);
 });
 
 test("inbound Tlon cites and media become quoted context and staged QM attachments", async () => {
@@ -353,10 +551,13 @@ test("inbound Tlon cites and media become quoted context and staged QM attachmen
         size: 10,
       },
     ]),
-    kind: "dm",
-    target: "~zod",
+    kind: "channel",
+    target: "chat/~zod/general",
   });
-  assert.equal(enriched.text, "What does this mean?\n\nQuoted Tlon message from ~nec:\n> referenced 123");
+  assert.equal(enriched.text, "What does this mean?");
+  assert.deepEqual(enriched.externalPromptData, [
+    { source: "tlon-citation:1", content: "Quoted Tlon message from ~nec:\n> referenced 123" },
+  ]);
   assert.deepEqual(enriched.attachments, [
     {
       name: "photo.png",
@@ -406,11 +607,38 @@ test("production cite lookup stays on the connected ship client", async () => {
     senderShip: "~zod",
     text: "look",
     content: [{ block: { cite: { chan: { nest: "chat/~zod/general", where: "/msg/123" } } } }],
-    kind: "dm",
-    target: "~zod",
+    kind: "channel",
+    target: "chat/~zod/general",
   });
   assert.deepEqual(paths, ["/v5/said/~zod/chat/~zod/general/post/123"]);
-  assert.equal(message.text, "look\n\nQuoted Tlon message from ~nec:\n> from the cited post");
+  assert.equal(message.text, "look");
+  assert.deepEqual(message.externalPromptData, [
+    { source: "tlon-citation:1", content: "Quoted Tlon message from ~nec:\n> from the cited post" },
+  ]);
+});
+
+test("inbound Tlon cites cannot read outside the active shared channel", async () => {
+  const resolved: string[] = [];
+  const connection = new TlonConnection(installation, async () => {}, {
+    resolveCite: async (cite) => {
+      resolved.push(cite.channelId);
+      return { author: "~nec", text: "private" };
+    },
+  });
+  const message = await connection.enrichInbound({
+    accountId: "support",
+    installationVersion: installation.version,
+    principalId: "alice@example.com",
+    messageId: "cross-channel-cite",
+    senderShip: "~zod",
+    text: "look",
+    content: [{ block: { cite: { chan: { nest: "chat/~zod/private", where: "/msg/123" } } } }],
+    kind: "channel",
+    target: "chat/~zod/general",
+  });
+  assert.deepEqual(resolved, []);
+  assert.equal(message.text, "look");
+  assert.deepEqual(message.inboundNotes, ["A cited Tlon message could not be loaded."]);
 });
 
 test("inbound attachment work caps attempted sources even when every download fails", async () => {
@@ -553,6 +781,35 @@ test("durable handoffs preserve event order and predecessor identity", async () 
   assert.deepEqual(accepted, [{ messageId: "first" }, { messageId: "second", previousId: "receipt-first" }]);
 });
 
+test("same message ids in different Tlon conversations are handed off independently", async () => {
+  const accepted: string[] = [];
+  const connection = new TlonConnection(
+    { ...installation, channels: ["chat/~zod/alpha", "chat/~zod/beta"] },
+    async (message) => {
+      accepted.push(message.target);
+      return `receipt-${message.target}`;
+    },
+  );
+  const receive = (
+    connection as unknown as {
+      receive(source: string, value: unknown, parse: typeof parseChannelMessage): void;
+    }
+  ).receive.bind(connection);
+  const event = (nest: string) => ({
+    nest,
+    response: {
+      post: {
+        id: "same-id",
+        "r-post": { set: { essay: { author: "~zod", content: [{ inline: [nest] }] } } },
+      },
+    },
+  });
+  receive("Channel", event("chat/~zod/alpha"), parseChannelMessage);
+  receive("Channel", event("chat/~zod/beta"), parseChannelMessage);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(accepted.sort(), ["chat/~zod/alpha", "chat/~zod/beta"]);
+});
+
 test("durable handoff failure remains visible after a reconnect status", async () => {
   const connection = new TlonConnection(installation, async () => {
     throw new Error("core unavailable");
@@ -673,6 +930,7 @@ test("outbound QM files upload through the connected ship and use native Tlon me
     ],
     idempotencyKey: "run:files",
     createdAt: 1,
+    connectorRef: 1_000_004,
   });
 
   assert.deepEqual(reads, [
@@ -727,6 +985,7 @@ test("attachment failures remain visible and cannot poison text delivery", async
     ],
     idempotencyKey: "run:fail-open",
     createdAt: 1,
+    connectorRef: 1_000_005,
   });
   assert.deepEqual(reads, ["1", "2"]);
   const wire = JSON.stringify(pokes[0]!.json);
@@ -782,35 +1041,35 @@ test("a blocked ship cannot stall another account or add API listeners", async (
   assert.equal(listeners, 0);
 });
 
-test("delivery work is ordered per account without blocking healthy accounts", async () => {
-  const sales = { ...installation, id: "sales", ship: "~nec", version: "2" };
-  let releaseFirst = (): void => {};
-  const firstBlocked = new Promise<void>((resolve) => {
-    releaseFirst = resolve;
-  });
+test("independent channel claims do not block each other on the same account", async () => {
+  const channels = ["chat/~sampel-palnet/alpha", "chat/~sampel-palnet/beta"];
+  const channelInstallation = { ...installation, channels };
   const started: string[] = [];
   const acknowledged: string[] = [];
-  const delivery = (id: string, accountId: string): Delivery => ({
+  const delivery = (id: string, target: string): Delivery => ({
     id,
     claimToken: `claim:${id}`,
     destination: {
       type: "tlon",
-      target: deliveryTarget(accountId, accountId === installation.id ? installation.version : "2"),
+      scopeVersion: "roster-1",
+      target: encodeDeliveryTarget({
+        accountId: installation.id,
+        accountVersion: installation.version,
+        kind: "channel",
+        target,
+      }),
     },
     text: id,
     idempotencyKey: `delivery:${id}`,
-    createdAt: Number(id.at(-1)),
+    createdAt: 1,
+    connectorRef: id === "alpha" ? 1_000_006 : 1_000_007,
   });
   const core = {
     ...operationLeases,
-    installations: async () => [installation, sales],
+    installations: async () => [channelInstallation],
     report: async () => {},
     presenceRuns: async () => [],
-    deliveries: async () => [
-      delivery("support-1", "support"),
-      delivery("support-2", "support"),
-      delivery("sales-1", "sales"),
-    ],
+    deliveries: async () => [delivery("alpha", channels[0]!), delivery("beta", channels[1]!)],
     ack: async (id: string) => {
       acknowledged.push(id);
     },
@@ -821,22 +1080,19 @@ test("delivery work is ordered per account without blocking healthy accounts", a
     stop: async () => {},
     runtimeStatus: () => ({ status: "connected" }),
     enrichInbound,
+    verifiedChannels: async () => channels,
     deliver: async (nextDelivery) => {
       started.push(nextDelivery.id);
-      if (nextDelivery.id === "support-1") await firstBlocked;
+      if (nextDelivery.id === "alpha") throw new Error("alpha unavailable");
     },
     publishPresence: async () => {},
     clearPresence: async () => {},
   }));
   const internals = controller as unknown as { reconcile(): Promise<void>; deliverPending(): Promise<void> };
   await internals.reconcile();
-  const pending = internals.deliverPending();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(started.sort(), ["sales-1", "support-1"]);
-  releaseFirst();
-  await pending;
-  assert.deepEqual(started, ["sales-1", "support-1", "support-2"]);
-  assert.deepEqual(acknowledged.sort(), ["sales-1", "support-1", "support-2"]);
+  await internals.deliverPending();
+  assert.deepEqual(started.sort(), ["alpha", "beta"]);
+  assert.deepEqual(acknowledged, ["beta"]);
 });
 
 test("current-generation claims are released while their connection is starting", async () => {
@@ -858,6 +1114,7 @@ test("current-generation claims are released while their connection is starting"
     text: "wait",
     idempotencyKey: "waiting-delivery",
     createdAt: 1,
+    connectorRef: 1_000_008,
   };
   const core = {
     inboundRecords: async () => [{ id: "waiting-inbound", message, createdAt: 1, claimToken: "inbound-claim" }],
@@ -885,6 +1142,222 @@ test("current-generation claims are released while their connection is starting"
   await internals.processInbound();
   await internals.deliverPending();
   assert.deepEqual(released, ["inbound:waiting-inbound", "delivery:waiting-delivery"]);
+});
+
+test("shutdown releases in-flight inbound and delivery claims", async () => {
+  const inboundMessage: InboundMessage = {
+    accountId: installation.id,
+    installationVersion: installation.version,
+    principalId: installation.principalId,
+    messageId: "shutdown-inbound",
+    senderShip: installation.ownerShip,
+    text: "wait",
+    kind: "dm",
+    target: installation.ownerShip,
+  };
+  const released: string[] = [];
+  const started: string[] = [];
+  const core = {
+    ...operationLeases,
+    installations: async () => [installation],
+    report: async () => {},
+    inboundRecords: async () => [
+      { id: "shutdown-inbound", message: inboundMessage, createdAt: 1, claimToken: "inbound-claim" },
+    ],
+    deliveries: async () => [
+      {
+        id: "shutdown-delivery",
+        claimToken: "delivery-claim",
+        destination: { type: "tlon", target: deliveryTarget() },
+        text: "wait",
+        idempotencyKey: "shutdown-delivery",
+        createdAt: 1,
+        connectorRef: 1_000_009,
+      },
+    ],
+    releaseInbound: async (id: string) => {
+      released.push(`inbound:${id}`);
+    },
+    releaseDelivery: async (id: string) => {
+      released.push(`delivery:${id}`);
+    },
+    ackInbound: async () => {
+      throw new Error("shutdown inbound was acknowledged");
+    },
+    ack: async () => {
+      throw new Error("shutdown delivery was acknowledged");
+    },
+  } as unknown as CoreClient;
+  const waitForAbort = (signal?: AbortSignal): Promise<never> =>
+    new Promise((_resolve, reject) => {
+      started.push("operation");
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  const controller = new TlonController(core, (next) => ({
+    installation: next,
+    start: async () => {},
+    stop: async () => {},
+    runtimeStatus: () => ({ status: "connected" }),
+    enrichInbound: async (_message, signal) => waitForAbort(signal),
+    deliver: async (_delivery, signal) => waitForAbort(signal),
+    publishPresence: async () => {},
+    clearPresence: async () => {},
+  }));
+  const internals = controller as unknown as {
+    abort: AbortController;
+    reconcile(): Promise<void>;
+    processInbound(): Promise<void>;
+    deliverPending(): Promise<void>;
+  };
+  await internals.reconcile();
+  const inbound = internals.processInbound();
+  const delivery = internals.deliverPending();
+  while (started.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  internals.abort.abort();
+  await Promise.all([inbound, delivery]);
+  assert.deepEqual(released.sort(), ["delivery:shutdown-delivery", "inbound:shutdown-inbound"]);
+});
+
+test("a stale preferred channel route falls through to a core-authorized alternate", async () => {
+  const channel = "chat/~sampel-palnet/general";
+  const channelInstallation = { ...installation, ownerVerified: false, channels: [channel] };
+  const alternate = {
+    ...installation,
+    id: "alternate",
+    ship: "~nec",
+    version: "2",
+    channels: [channel],
+  };
+  const acknowledged: string[] = [];
+  const released: string[] = [];
+  const delivered: string[] = [];
+  const channelLeases: Array<{ id: string; scopeVersion?: string }> = [];
+  const core = {
+    installations: async () => [channelInstallation, alternate],
+    report: async () => {},
+    presenceRuns: async () => [],
+    acquire: async (id: string, _version: string, requestedChannel?: string, scopeVersion?: string) => {
+      if (requestedChannel) channelLeases.push({ id, scopeVersion });
+      return requestedChannel && id === installation.id ? null : `lease:${id}`;
+    },
+    release: async () => {},
+    run: async () => ({
+      runId: "channel-run",
+      accountId: installation.id,
+      accountVersion: installation.version,
+      conversationId: channel,
+      status: "done",
+      activeTools: [],
+      scopeVersion: "roster-1",
+    }),
+    deliveries: async () => [
+      {
+        id: "stale-candidate",
+        claimToken: "delivery-claim",
+        destination: {
+          type: "tlon",
+          scopeVersion: "roster-1",
+          target: encodeDeliveryTarget({
+            accountId: installation.id,
+            accountVersion: installation.version,
+            kind: "channel",
+            target: channel,
+          }),
+        },
+        text: "durable output",
+        idempotencyKey: "run:channel-run",
+        createdAt: 1,
+        connectorRef: 1_000_010,
+      },
+    ],
+    ack: async (id: string) => {
+      acknowledged.push(id);
+    },
+    releaseDelivery: async (id: string) => {
+      released.push(id);
+    },
+  } as unknown as CoreClient;
+  const controller = new TlonController(core, (next) => ({
+    installation: next,
+    start: async () => {},
+    stop: async () => {},
+    runtimeStatus: () => ({ status: "connected" }),
+    verifiedChannels: async () => [channel],
+    enrichInbound,
+    deliver: async () => {
+      delivered.push(next.id);
+    },
+    publishPresence: async () => {},
+    clearPresence: async () => {},
+  }));
+  const internals = controller as unknown as { reconcile(): Promise<void>; deliverPending(): Promise<void> };
+  await internals.reconcile();
+  await internals.deliverPending();
+  assert.deepEqual(delivered, ["alternate"]);
+  assert.deepEqual(acknowledged, ["stale-candidate"]);
+  assert.deepEqual(released, []);
+  assert.deepEqual(channelLeases, [
+    { id: installation.id, scopeVersion: "roster-1" },
+    { id: alternate.id, scopeVersion: "roster-1" },
+  ]);
+});
+
+test("a delivery from a stale shared-room roster is acknowledged without posting", async () => {
+  const channel = "chat/~sampel-palnet/general";
+  const acknowledged: string[] = [];
+  let delivered = false;
+  const core = {
+    installations: async () => [{ ...installation, channels: [channel] }],
+    report: async () => {},
+    acquire: async (_id: string, _version: string, requestedChannel?: string) =>
+      requestedChannel ? null : "source-lease",
+    release: async () => {},
+    run: async () => {
+      throw new Error("post deliveries must not depend on run idempotency keys");
+    },
+    channelScopeIsCurrent: async () => false,
+    deliveries: async () => [
+      {
+        id: "stale-roster-output",
+        claimToken: "delivery-claim",
+        connectorRef: 1_000_013,
+        destination: {
+          type: "tlon",
+          scopeVersion: "old-roster",
+          target: encodeDeliveryTarget({
+            accountId: installation.id,
+            accountVersion: installation.version,
+            kind: "channel",
+            target: channel,
+          }),
+        },
+        text: "old roster output",
+        idempotencyKey: "post:shared-session:surface-tool",
+        createdAt: 1,
+      },
+    ],
+    ack: async (id: string) => {
+      acknowledged.push(id);
+    },
+  } as unknown as CoreClient;
+  const controller = new TlonController(core, (next) => ({
+    installation: next,
+    start: async () => {},
+    stop: async () => {},
+    runtimeStatus: () => ({ status: "connected" }),
+    verifiedChannels: async () => [channel],
+    enrichInbound,
+    deliver: async () => {
+      delivered = true;
+    },
+    publishPresence: async () => {},
+    clearPresence: async () => {},
+  }));
+  const internals = controller as unknown as { reconcile(): Promise<void>; deliverPending(): Promise<void> };
+  await internals.reconcile();
+  await internals.deliverPending();
+  assert.equal(delivered, false);
+  assert.deepEqual(acknowledged, ["stale-roster-output"]);
 });
 
 test("controller mirrors active run tools and clears presence after delivery", async () => {
@@ -998,6 +1471,7 @@ test("controller mirrors active run tools and clears presence after delivery", a
       text: "done",
       idempotencyKey: "run:run-1",
       createdAt: 1,
+      connectorRef: 1_000_011,
     },
   ];
   await internals.deliverPending();

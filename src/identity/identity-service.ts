@@ -27,7 +27,7 @@ export interface IdentityService extends IdentityProvider {
   reactivate(externalId: string): Promise<void>;
   recordDirectorySync(removedIds: string[], presentIds: string[]): Promise<DirectorySyncOutcome>;
   hydrate(): Promise<void>;
-  refresh(): Promise<void>;
+  refresh(force?: boolean): Promise<void>;
 }
 
 export function createIdentityService(backing?: DurableMap<DeactivationRecord>): IdentityService {
@@ -37,6 +37,8 @@ export function createIdentityService(backing?: DurableMap<DeactivationRecord>):
   let refreshedAt = 0;
   let refreshP: Promise<void> | null = null;
   let hydrateP: Promise<void> | null = null;
+  let mutationGeneration = 0;
+  let mutations = 0;
 
   function classify(externalId: string, isExternalGuest?: boolean): Principal {
     const type: Principal["type"] = deactivated.has(personKey(externalId)) || isExternalGuest ? "guest" : "internal";
@@ -48,14 +50,30 @@ export function createIdentityService(backing?: DurableMap<DeactivationRecord>):
     const existing = deactivated.get(key);
     if (existing && (existing.source === "manual" || existing.source === source)) return;
     const record: DeactivationRecord = { principalId: externalId, source, at: Date.now() };
+    mutationGeneration++;
+    mutations++;
     deactivated.set(key, record);
-    await store.put(key, record);
+    try {
+      await store.put(key, record);
+      deactivated.set(key, record);
+    } finally {
+      mutations--;
+      mutationGeneration++;
+    }
   }
 
   async function reactivate(externalId: string): Promise<void> {
     const key = personKey(externalId);
+    mutationGeneration++;
+    mutations++;
     deactivated.delete(key);
-    await store.delete(key);
+    try {
+      await store.delete(key);
+      deactivated.delete(key);
+    } finally {
+      mutations--;
+      mutationGeneration++;
+    }
   }
 
   return {
@@ -78,7 +96,9 @@ export function createIdentityService(backing?: DurableMap<DeactivationRecord>):
     },
     hydrate(): Promise<void> {
       if (!hydrateP) {
+        const generation = mutationGeneration;
         hydrateP = store.all().then((records) => {
+          if (mutations || generation !== mutationGeneration) return;
           for (const r of records) {
             const key = personKey(r.principalId);
             if (!deactivated.has(key)) deactivated.set(key, r);
@@ -87,13 +107,15 @@ export function createIdentityService(backing?: DurableMap<DeactivationRecord>):
       }
       return hydrateP;
     },
-    async refresh(): Promise<void> {
+    async refresh(force = false): Promise<void> {
       const now = Date.now();
       if (refreshP) return refreshP;
-      if (now - refreshedAt < REFRESH_TTL_MS) return;
+      if (!force && now - refreshedAt < REFRESH_TTL_MS) return;
+      const generation = mutationGeneration;
       refreshP = store
         .all()
         .then((records) => {
+          if (mutations || generation !== mutationGeneration) return;
           deactivated.clear();
           for (const record of records) deactivated.set(personKey(record.principalId), record);
           refreshedAt = Date.now();

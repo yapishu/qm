@@ -37,13 +37,7 @@ import {
   type ReachDirectory,
 } from "../reach/reach.ts";
 import { createSurfaceContextPuller } from "./surface-context-puller.ts";
-import {
-  isProjectGroupRef,
-  projectGroupRef,
-  projectIdFromGroupRef,
-  projectScopeId,
-  type Project,
-} from "../projects/project-store.ts";
+import { projectGroupRef, projectIdFromGroupRef, projectScopeId, type Project } from "../projects/project-store.ts";
 
 import type { App, AppDeps, ContextSummary, ProjectView, FileListPage } from "./app-types.ts";
 import { toFileItem } from "./app-types.ts";
@@ -87,8 +81,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   async function approvalCurrentForSession(session: Session, record: PendingApprovalRecord): Promise<boolean> {
-    const parsed = parseScopeId(session.scopeId);
-    if (parsed.kind !== "group" || !isProjectGroupRef(parsed.ref)) return true;
+    if ((await managedScopeVersion(session.scopeId)) === null) return true;
     const requester = record.request?.actor.externalId;
     return (
       !!requester &&
@@ -111,9 +104,8 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     record: PendingApprovalRecord,
   ): Promise<boolean> {
     if (record.request?.actor.externalId !== viewer) return false;
-    if ((await managedProjectMembership(session.scopeId, viewer)) === false) return false;
-    const parsed = parseScopeId(session.scopeId);
-    if (parsed.kind !== "group" || !isProjectGroupRef(parsed.ref)) return true;
+    if ((await managedScopeMembership(session.scopeId, viewer)) === false) return false;
+    if ((await managedScopeVersion(session.scopeId)) === null) return true;
     if (!samePerson(record.request?.actor.externalId, viewer) || record.createdAt === undefined) return false;
     const window = (await deps.sessions.listParticipants()).find(
       (candidate) => candidate.sessionId === session.id && samePerson(candidate.principalId, viewer),
@@ -210,8 +202,8 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     if (!conversation.channelRef) return false;
     const scope = scopeId(conversation.kind, conversation.channelRef);
     if (await principalIsCurrentSharedScopeMember(viewer, scope)) {
-      if (conversation.kind !== "group" || !isProjectGroupRef(conversation.channelRef)) return true;
-      return run.request.scopeVersion === (await deps.projects?.version(conversation.channelRef));
+      const version = await managedScopeVersion(scope);
+      return version === null || run.request.scopeVersion === version;
     }
     if (conversation.kind !== "channel") return false;
     const isPublic = (await deps.directory.channelPrivacy?.(conversation.channelRef).catch(() => undefined)) === false;
@@ -243,8 +235,12 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     return Promise.all(projects.map(projectView));
   }
 
-  async function managedProjectMembership(scope: ScopeId, principalId: string): Promise<boolean | undefined> {
+  async function managedScopeMembership(scope: ScopeId, principalId: string): Promise<boolean | undefined> {
     const { kind, ref } = parseScopeId(scope);
+    if (kind === "channel" && deps.tlonInstallations?.recognizes(ref)) {
+      if (!deps.identity.isInternal(deps.identity.classify(principalId))) return false;
+      return (await deps.tlonInstallations.membership(ref, principalId).catch(() => false)) === true;
+    }
     if (kind !== "group" || projectIdFromGroupRef(ref) === null) return undefined;
     if (!deps.projects) return false;
     const project = await deps.projects.get(projectIdFromGroupRef(ref)!);
@@ -256,9 +252,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
 
   async function sessionsForViewer(principalId: string): Promise<Session[]> {
     const sessions = await deps.sessions.listByParticipant(principalId);
-    const allowed = await Promise.all(
-      sessions.map((session) => managedProjectMembership(session.scopeId, principalId)),
-    );
+    const allowed = await Promise.all(sessions.map((session) => managedScopeMembership(session.scopeId, principalId)));
     return sessions.filter((_session, index) => allowed[index] !== false);
   }
 
@@ -274,6 +268,17 @@ export function createAppHelpers(deps: AppDeps, app: App) {
           kind: "channel",
           name: c.name,
           ...(c.isPrivate !== undefined ? { isPrivate: c.isPrivate } : {}),
+          sessionCount: 0,
+          lastActivityAt: null,
+        });
+      }
+      for (const c of (await deps.tlonInstallations?.channelsFor(principalId)) ?? []) {
+        const sid = scopeId("channel", c.channelId);
+        byScope.set(sid, {
+          scopeId: sid,
+          kind: "channel",
+          name: c.name,
+          isPrivate: true,
           sessionCount: 0,
           lastActivityAt: null,
         });
@@ -344,9 +349,10 @@ export function createAppHelpers(deps: AppDeps, app: App) {
       scopeId("org", orgIdOf()),
     ]);
     try {
-      const [sessions, channels, groups, projects] = await Promise.all([
+      const [sessions, channels, tlonChannels, groups, projects] = await Promise.all([
         deps.sessions ? sessionsForViewer(principalId) : Promise.resolve([]),
         deps.directory ? deps.directory.listChannelsFor(principalId) : Promise.resolve([]),
+        deps.tlonInstallations?.channelsFor(principalId) ?? Promise.resolve([]),
         deps.directory?.listGroupsFor?.(principalId) ?? Promise.resolve([]),
         projectsForViewer(principalId),
       ]);
@@ -355,6 +361,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
         const scope = scopeId("channel", channel.channelId);
         if (channel.isPrivate === true || historical.has(scope)) scopes.add(scope);
       }
+      for (const channel of tlonChannels) scopes.add(scopeId("channel", channel.channelId));
       for (const groupId of groups) scopes.add(scopeId("group", groupId));
       for (const project of projects) scopes.add(project.scopeId);
     } catch (error) {
@@ -368,6 +375,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   const scopeMembershipDeps = {
+    ...(deps.tlonInstallations ? { managedChannels: deps.tlonInstallations } : {}),
     ...(deps.projects ? { managedGroups: deps.projects } : {}),
     ...(deps.directory ? { directory: deps.directory } : {}),
     ...(deps.identity ? { identity: deps.identity } : {}),
@@ -400,6 +408,17 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   const principalCanManageScope = createCanManageScope(scopeMembershipDeps);
   const membershipControlsScope = createMembershipControlsScope(scopeMembershipDeps);
 
+  async function managedScopeVersion(targetScope: ScopeId): Promise<string | undefined | null> {
+    const { kind, ref } = parseScopeId(targetScope);
+    if (kind === "channel" && deps.tlonInstallations?.recognizes(ref)) {
+      return deps.tlonInstallations.version(ref).catch(() => undefined);
+    }
+    if (kind === "group" && deps.projects?.recognizes(ref)) {
+      return deps.projects.version(ref).catch(() => undefined);
+    }
+    return null;
+  }
+
   async function authorizesCapabilityScope(
     claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "botActor" | "liveActor" | "members">,
   ): Promise<boolean> {
@@ -425,11 +444,9 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     ) {
       return false;
     }
-    if (kind !== "group" || deps.projects?.recognizes(ref) !== true) return true;
-    return (
-      (await principalCanManageScope(claims.actorId, claims.scopeId)) &&
-      claims.scopeVersion === (await deps.projects.version(ref))
-    );
+    const version = await managedScopeVersion(claims.scopeId);
+    if (version === null) return true;
+    return (await principalCanManageScope(claims.actorId, claims.scopeId)) && claims.scopeVersion === version;
   }
 
   const principalManagesArtifactHome = createManagesArtifactHome(scopeMembershipDeps, principalCanManageScope);
@@ -612,7 +629,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     viewerMayUseRun,
     projectView,
     projectsForViewer,
-    managedProjectMembership,
+    managedScopeMembership,
     sessionsForViewer,
     contextsFor,
     filesForViewer,

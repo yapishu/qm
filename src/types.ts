@@ -165,6 +165,7 @@ export interface Destination {
   type: string;
   target: string;
   queueKey?: string;
+  scopeVersion?: string;
   audienceScopeId?: ScopeId;
   onBehalfOf?: string;
   editRef?: string;
@@ -263,6 +264,7 @@ export interface Monitor extends TriggerBase {
 
 export interface Delivery {
   id: string;
+  enqueueSeq?: number;
   destination: Destination;
   text: string;
   attachments?: OutgoingAttachment[];
@@ -275,6 +277,7 @@ export interface Delivery {
   deliverLatencyMs?: number;
   slackApiMs?: number;
   claimToken?: string;
+  connectorRef?: number;
 }
 
 export interface SurfaceContextQuery {
@@ -425,6 +428,7 @@ export interface TurnRequest {
   detectOpener?: string;
   attachments?: IncomingAttachment[];
   inboundNotes?: string[];
+  externalPromptData?: Array<{ source: string; content: string }>;
   model?: string;
   harness?: string;
   thinkingLevel?: string;

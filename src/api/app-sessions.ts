@@ -69,7 +69,7 @@ export function createSessionMethods(
     projectView,
     reconcileProjectMember,
     syncProjectChannelRoster,
-    managedProjectMembership,
+    managedScopeMembership,
     approvalRecordIsCurrent,
     principalCanAccessCurrentScope,
     principalGitPermission,
@@ -508,10 +508,28 @@ export function createSessionMethods(
 
     async regenerateTitle(sessionId, principalId) {
       const session = await deps.sessions.get(sessionId);
-      if (!session || (await managedProjectMembership(session.scopeId, principalId)) === false) return null;
+      if (!session || (await managedScopeMembership(session.scopeId, principalId)) === false) return null;
       const parsed = parseScopeId(session.scopeId);
-      const projectMembers = parsed.kind === "group" ? await deps.projects?.members(parsed.ref) : undefined;
-      return deps.orchestrator.regenerateTitle(sessionId, principalId, projectMembers);
+      if (parsed.kind === "channel" && deps.tlonInstallations?.recognizes(parsed.ref)) {
+        const version = await deps.tlonInstallations.version(parsed.ref);
+        const members = await deps.tlonInstallations.members(parsed.ref);
+        return (
+          (await deps.tlonInstallations.withVersion(parsed.ref, version, async () => {
+            if (!members?.includes(principalId)) return null;
+            return deps.orchestrator.regenerateTitle(sessionId, principalId, members);
+          })) ?? null
+        );
+      }
+      const projectId = parsed.kind === "group" ? projectIdFromGroupRef(parsed.ref) : null;
+      if (!projectId) return deps.orchestrator.regenerateTitle(sessionId, principalId);
+      const projects = deps.projects;
+      if (!projects) return null;
+      return projects.withRosterLock(projectId, async (project) => {
+        if (project.orgId !== orgIdOf()) return null;
+        const members = await projects.members(parsed.ref);
+        if (!members?.includes(principalId)) return null;
+        return deps.orchestrator.regenerateTitle(sessionId, principalId, members);
+      });
     },
 
     async forkSession(sessionId, principalId, opts) {
@@ -580,6 +598,16 @@ export function createSessionMethods(
         const session = (await deps.sessions.get(forked.id)) ?? forked;
         return { session, entries: transcriptEntries(await deps.sessions.getEntries(forked.id)) };
       };
+      if (parsed.kind === "channel" && deps.tlonInstallations?.recognizes(parsed.ref)) {
+        const version = await deps.tlonInstallations.version(parsed.ref);
+        const members = await deps.tlonInstallations.members(parsed.ref);
+        return (
+          (await deps.tlonInstallations.withVersion(parsed.ref, version, async () => {
+            if (!members?.includes(principalId)) return null;
+            return fork(members);
+          })) ?? null
+        );
+      }
       const projectId = parsed.kind === "group" ? projectIdFromGroupRef(parsed.ref) : null;
       if (!projectId) return fork();
       const projects = deps.projects;
@@ -616,6 +644,16 @@ export function createSessionMethods(
       };
       if (parsed.kind === "personal") {
         return parsed.ref === principalId ? create() : null;
+      }
+      if (parsed.kind === "channel" && deps.tlonInstallations?.recognizes(parsed.ref)) {
+        const version = await deps.tlonInstallations.version(parsed.ref);
+        const members = await deps.tlonInstallations.members(parsed.ref);
+        return (
+          (await deps.tlonInstallations.withVersion(parsed.ref, version, async () => {
+            if (!members?.includes(principalId)) return null;
+            return create(members);
+          })) ?? null
+        );
       }
       const projectId = parsed.kind === "group" ? projectIdFromGroupRef(parsed.ref) : null;
       if (projectId) {

@@ -63,8 +63,44 @@ export function createTurnMethods(
       let projectAudience: Principal[] | undefined;
       let projectName: string | undefined;
       let projectVersion: string | undefined;
+      let tlonVersion: string | undefined;
       let sessionParticipantIds: string[] | undefined;
       const conversationRef = req.conversation.channelRef;
+      let tlonAudience: Principal[] | undefined;
+      const managedTlonChannel =
+        req.conversation.kind === "channel" &&
+        !!conversationRef &&
+        deps.tlonInstallations?.recognizes(conversationRef) === true;
+      if (req.surface === "tlon" && req.conversation.kind === "channel" && !managedTlonChannel) {
+        return { status: "refused", reason: "you're not a member of that context" };
+      }
+      if (managedTlonChannel) {
+        if (req.surface === "tlon") {
+          const timeline = `tlon:channel:${conversationRef!.slice("tlon:".length)}`;
+          const threadPrefix = `${timeline}:thread:`;
+          if (req.conversation.threadRef !== timeline && !req.conversation.threadRef.startsWith(threadPrefix)) {
+            return { status: "refused", reason: "that conversation lives in a different context" };
+          }
+        }
+        tlonVersion = await deps.tlonInstallations!.version(conversationRef!);
+        const memberSnapshot = await deps.tlonInstallations!.channelMembers(conversationRef!);
+        const members = await deps.tlonInstallations!.withVersion(
+          conversationRef!,
+          tlonVersion,
+          async () => memberSnapshot,
+        );
+        if (!members?.some((member) => member.principalId === actor.id)) {
+          return { status: "refused", reason: "you're not a member of that context" };
+        }
+        tlonAudience = (members ?? []).flatMap((member) => {
+          const principal = deps.identity.classify(member.principalId);
+          if (!deps.identity.isInternal(principal)) return [];
+          return [
+            { ...principal, displayName: member.principalId === actor.id ? actor.displayName : member.displayName },
+          ];
+        });
+        sessionParticipantIds = tlonAudience.map((member) => member.id);
+      }
       const projectGroup = req.conversation.kind === "group" && !!conversationRef && isProjectGroupRef(conversationRef);
       const projectId = projectGroup ? projectIdFromGroupRef(conversationRef) : null;
 
@@ -100,10 +136,21 @@ export function createTurnMethods(
         }
       }
 
-      async function withCurrentProjectRoster<T>(fn: () => Promise<T>): Promise<T | null> {
+      async function withCurrentManagedRoster<T>(fn: () => Promise<T>): Promise<T | null> {
+        if (managedTlonChannel) {
+          if (!conversationRef || !tlonVersion || !deps.tlonInstallations) return null;
+          return (await deps.tlonInstallations.withVersion(conversationRef, tlonVersion, fn)) ?? null;
+        }
         if (!projectId || !deps.projects) return fn();
         if (!conversationRef || !projectVersion) return null;
         return (await deps.projects.withVersion(conversationRef, projectVersion, fn)) ?? null;
+      }
+
+      if (managedTlonChannel) {
+        const existing = await deps.sessions.getByThread(req.conversation.threadRef);
+        if (existing && existing.scopeId !== scopeId("channel", conversationRef!)) {
+          return { status: "refused", reason: "that conversation lives in a different context" };
+        }
       }
 
       if (req.surface === "web") {
@@ -117,7 +164,7 @@ export function createTurnMethods(
           if (existing.scopeId !== claimed) {
             return { status: "refused", reason: "that conversation lives in a different context" };
           }
-        } else if (threadRef.startsWith("web:") && !threadRef.startsWith(`web:${actor.id}:`)) {
+        } else if ((managedTlonChannel || threadRef.startsWith("web:")) && !threadRef.startsWith(`web:${actor.id}:`)) {
           return { status: "refused", reason: "you can only start a new conversation on your own thread" };
         }
         const org = scopeId("org", orgIdOf());
@@ -194,6 +241,7 @@ export function createTurnMethods(
       const rawAudience = req.conversation.audience ?? [req.actor];
       const audience: Principal[] =
         projectAudience ??
+        tlonAudience ??
         rawAudience.map((a) => {
           const p = deps.identity.classify(a.externalId, a.isExternalGuest);
           if (p.id === actor.id) return actor;
@@ -203,7 +251,9 @@ export function createTurnMethods(
 
       const publishMembers =
         projectAudience ??
+        tlonAudience ??
         req.conversation.publishMembers?.map((a) => deps.identity.classify(a.externalId, a.isExternalGuest));
+      const isPrivate = managedTlonChannel ? true : req.conversation.isPrivate;
 
       const conversation: Conversation = {
         kind: req.conversation.kind,
@@ -213,12 +263,18 @@ export function createTurnMethods(
           ? { channelName: projectName ?? req.conversation.channelName }
           : {}),
         audience,
-        ...(req.conversation.isPrivate !== undefined ? { isPrivate: req.conversation.isPrivate } : {}),
+        ...(isPrivate !== undefined ? { isPrivate } : {}),
         ...(req.conversation.isMpim !== undefined ? { isMpim: req.conversation.isMpim } : {}),
         ...(publishMembers ? { publishMembers } : {}),
       };
 
       const origin = resolveTurnOrigin(req);
+      const externalPromptData = Array.isArray(req.externalPromptData)
+        ? req.externalPromptData
+            .filter((datum) => datum && typeof datum.source === "string" && typeof datum.content === "string")
+            .slice(0, 10)
+            .map((datum) => ({ source: datum.source.slice(0, 200), content: datum.content.slice(0, 16_000) }))
+        : [];
 
       const input = {
         surface: req.surface,
@@ -238,6 +294,7 @@ export function createTurnMethods(
         ...(req.detectOpener ? { detectOpener: req.detectOpener } : {}),
         ...(req.attachments?.length ? { attachments: req.attachments } : {}),
         ...(req.inboundNotes?.length ? { inboundNotes: req.inboundNotes } : {}),
+        ...(externalPromptData.length ? { externalPromptData } : {}),
         ...(req.harness ? { harness: req.harness } : {}),
         ...(req.model ? { model: req.model } : {}),
         ...turnModelOptions(req),
@@ -255,10 +312,10 @@ export function createTurnMethods(
         ...(typeof req.clientSentAt === "number" ? { clientSentAt: req.clientSentAt } : {}),
         ...(req.approval ? { approval: req.approval } : {}),
         ...(sessionParticipantIds ? { sessionParticipantIds } : {}),
-        ...(projectVersion ? { scopeVersion: projectVersion } : {}),
+        ...((projectVersion ?? tlonVersion) ? { scopeVersion: projectVersion ?? tlonVersion } : {}),
       };
 
-      if (projectGroup && req.approval) {
+      if ((projectGroup || managedTlonChannel) && req.approval) {
         const [approval, approvalSession] = await Promise.all([
           deps.approvals?.get(req.approval.requestId),
           deps.sessions.getByThread(conversation.threadRef),
@@ -270,10 +327,13 @@ export function createTurnMethods(
           !(await approvalRecordIsCurrent(approval, approvalSession)) ||
           !(await approvalVisibleToViewer(approvalSession, actor.id, approval))
         ) {
-          return { status: "refused", reason: "approval isn't visible in your project tenure" };
+          return { status: "refused", reason: "approval isn't visible in your shared-context tenure" };
         }
       }
-      const blocked = await pendingApprovalResultForThread(conversation.threadRef, projectGroup ? actor.id : undefined);
+      const blocked = await pendingApprovalResultForThread(
+        conversation.threadRef,
+        projectGroup || managedTlonChannel ? actor.id : undefined,
+      );
       let request = input;
       if (blocked) {
         const pendingList = blocked.pendingApprovals ?? [];
@@ -283,8 +343,9 @@ export function createTurnMethods(
 
       let dedupKey: string | undefined;
       if (req.idempotencyKey) {
-        dedupKey =
-          projectVersion === undefined ? req.idempotencyKey : `${req.idempotencyKey}:project-${projectVersion}`;
+        if (projectVersion !== undefined) dedupKey = `${req.idempotencyKey}:project-${projectVersion}`;
+        else if (tlonVersion !== undefined) dedupKey = `${req.idempotencyKey}:tlon-${tlonVersion}`;
+        else dedupKey = req.idempotencyKey;
       }
 
       if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
@@ -339,7 +400,7 @@ export function createTurnMethods(
           const route = routeWake(wake, true, resolveTurnOrigin(live.request).kind === "ambient");
           if (route.kind === "steer" || route.kind === "drop") {
             const steerTs = origin.kind === "human" ? (origin.messageTs ?? origin.entryTs) : origin.entryTs;
-            const routedRunId = await withCurrentProjectRoster(async () => {
+            const routedRunId = await withCurrentManagedRoster(async () => {
               if (route.kind === "steer")
                 await deps.signals!.send(live.id, {
                   kind: route.signal,
@@ -349,8 +410,7 @@ export function createTurnMethods(
                 });
               return live.id;
             });
-            if (!routedRunId)
-              return { status: "refused", reason: "project membership changed; retry from the current project" };
+            if (!routedRunId) return { status: "refused", reason: "shared context membership changed; retry" };
             if (route.kind === "steer") {
               const after = await deps.runs.get(live.id);
               if (!after || isTerminal(after.status)) {
@@ -385,7 +445,7 @@ export function createTurnMethods(
         if (ambientSession) {
           const liveAmbient = await deps.runs.activeForThread(ambientRef);
           if (liveAmbient && !isTerminal(liveAmbient.status)) {
-            const routedRunId = await withCurrentProjectRoster(async () => {
+            const routedRunId = await withCurrentManagedRoster(async () => {
               if (deps.signals)
                 await deps.signals.send(liveAmbient.id, {
                   kind: "steer",
@@ -395,8 +455,7 @@ export function createTurnMethods(
                 });
               return liveAmbient.id;
             });
-            if (!routedRunId)
-              return { status: "refused", reason: "project membership changed; retry from the current project" };
+            if (!routedRunId) return { status: "refused", reason: "shared context membership changed; retry" };
             const after = await deps.runs.get(liveAmbient.id);
             if (!after || isTerminal(after.status)) {
               const own = (await replayOrphanedRunSignals(liveAmbient.id)).find(
@@ -424,8 +483,8 @@ export function createTurnMethods(
           maxAttempts: deps.maxAttempts,
           ...(dedupKey ? { dedupKey } : {}),
         });
-      const enqueued = await withCurrentProjectRoster(enqueue);
-      if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };
+      const enqueued = await withCurrentManagedRoster(enqueue);
+      if (!enqueued) return { status: "refused", reason: "shared context membership changed; retry" };
       const { run, deduped } = enqueued;
       if (!deduped) {
         deps.sessionStateBus?.emit({

@@ -9,6 +9,13 @@ import { buildApp } from "../src/wiring.ts";
 import type { Config } from "../src/config.ts";
 import type { TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createSessionMethods } from "../src/api/app-sessions.ts";
+import type { AppDeps } from "../src/api/app-types.ts";
+import type { AppHelpers } from "../src/api/app-helpers.ts";
+import { createTlonInstallationStore, tlonChannelRef } from "../src/surfaces/tlon-installation.ts";
+import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { scopeId } from "../src/types.ts";
 
 function freshApp() {
   const dataDir = mkdtempSync(join(tmpdir(), "ap-title-"));
@@ -73,6 +80,80 @@ test("regenerateTitle retitles from the visible transcript; a stranger gets null
   assert.equal(refreshed?.title, "Chat: Investigate the flaky CI job");
   assert.equal(await app.regenerateTitle(sid, "intruder"), null);
   assert.equal(await app.regenerateTitle("does-not-exist", "U1"), null);
+});
+
+test("a managed Tlon roster cannot change while a shared title is being generated", async () => {
+  const store = createTlonInstallationStore(
+    "acme",
+    createMemoryMap() as Parameters<typeof createTlonInstallationStore>[1],
+    "title-roster-test-key",
+    createMemoryMap() as Parameters<typeof createTlonInstallationStore>[3],
+    createMemoryAdvisoryLock(),
+  );
+  const channel = "chat/~sampel-palnet/general";
+  const channelRef = tlonChannelRef(channel);
+  const connection = await store.create("alice@example.com", {
+    ship: "~sampel-palnet",
+    url: "https://sampel-palnet.tlon.network",
+    code: "secret",
+    ownerShip: "~zod",
+    channels: [channel],
+  });
+  await store.enqueueInbound({
+    accountId: connection.id,
+    installationVersion: connection.version,
+    principalId: "alice@example.com",
+    messageId: "owner-link",
+    senderShip: "~zod",
+    text: `/qm-link ${connection.ownerVerificationCode}`,
+    kind: "dm",
+    target: "~zod",
+  });
+  await store.report(connection.id, {
+    version: connection.version,
+    status: "connected",
+    verifiedChannels: [channel],
+  });
+  let titleStarted = (): void => {};
+  const started = new Promise<void>((resolve) => {
+    titleStarted = resolve;
+  });
+  let finishTitle = (): void => {};
+  const finish = new Promise<void>((resolve) => {
+    finishTitle = resolve;
+  });
+  const methods = createSessionMethods(
+    {
+      sessions: {
+        get: async () => ({ id: "shared-title", scopeId: scopeId("channel", channelRef) }),
+      },
+      tlonInstallations: store,
+      orchestrator: {
+        regenerateTitle: async () => {
+          titleStarted();
+          await finish;
+          return { title: "Private decision" };
+        },
+      },
+    } as unknown as AppDeps,
+    {
+      managedScopeMembership: async () => true,
+    } as unknown as AppHelpers,
+  );
+  const title = methods.regenerateTitle("shared-title", "alice@example.com");
+  await started;
+  let rosterChanged = false;
+  const changeRoster = store
+    .report(connection.id, { version: connection.version, status: "connected", verifiedChannels: [] })
+    .then(() => {
+      rosterChanged = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rosterChanged, false);
+  finishTitle();
+  assert.deepEqual(await title, { title: "Private decision" });
+  await changeRoster;
+  assert.deepEqual(await store.members(channelRef), []);
 });
 
 test("the title lands even when the turn pauses on approval (early titling off the first message)", async () => {

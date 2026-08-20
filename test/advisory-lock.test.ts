@@ -73,6 +73,39 @@ test("pg mutex: DIFFERENT keys run concurrently (independent locks)", { skip }, 
   }
 });
 
+test("pg mutex: many keys use one pool client and leave capacity for locked work", { skip }, async () => {
+  const pg = createPgPool(URL!, []);
+  try {
+    const lock = createPostgresAdvisoryLock(pg, { pollMs: 20, timeoutMs: 1_000 });
+    const keys = Array.from({ length: 20 }, (_, index) => `roster:channel:${index}`);
+    const result = await lock.withLocks!(keys, async () => {
+      const rows = await pg.q("SELECT 42 AS value");
+      return Number(rows[0]?.value);
+    });
+    assert.equal(result, 42);
+  } finally {
+    await pg.close();
+  }
+});
+
+test("pg mutex: independent lock callbacks cannot exhaust their shared query pool", { skip }, async () => {
+  const pg = createPgPool(URL!, []);
+  try {
+    const lock = createPostgresAdvisoryLock(pg, { pollMs: 20, timeoutMs: 1_000 });
+    const values = await Promise.all(
+      Array.from({ length: 10 }, (_, index) =>
+        lock.withLock(`roster:independent:${index}`, async () => Number((await pg.q("SELECT 42 AS value"))[0]?.value)),
+      ),
+    );
+    assert.deepEqual(
+      values,
+      Array.from({ length: 10 }, () => 42),
+    );
+  } finally {
+    await pg.close();
+  }
+});
+
 test("pg mutex: the lock is released after fn THROWS (the next acquire succeeds)", { skip }, async () => {
   const pg = createPgPool(URL!, []);
   try {

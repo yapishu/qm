@@ -192,6 +192,30 @@ test("managed groups override Slack membership and historical sessions grant no 
   );
 });
 
+test("managed Tlon channels authorize current members without Slack directory state", async () => {
+  const channel = "tlon:chat%2F~zod%2Fgeneral";
+  const managedChannels = {
+    recognizes: (ref: string) => ref === channel,
+    membership: async (_ref: string, principalId: string) => principalId === "alice",
+    members: async () => ["alice"],
+    version: async () => "1",
+    withVersion: async <T>(_ref: string, version: string | undefined, fn: () => Promise<T>) =>
+      version === "1" ? fn() : undefined,
+  };
+  const deps = {
+    managedChannels,
+    directory: {
+      channelMember: async () => false,
+      groupMember: async () => false,
+      channelPrivacy: async () => undefined,
+    },
+  };
+
+  assert.equal(await createCanReadScope(deps)("alice", `channel:${channel}`), true);
+  assert.equal(await createCanManageScope(deps)("alice", `channel:${channel}`), true);
+  assert.equal(await createCanManageScope(deps)("bob", `channel:${channel}`), false);
+});
+
 test("capability scope checks follow current shared rosters", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "capability-roster-")) }));
   await built.app.upsertDirectory([{ principalId: "member", displayName: "Member", type: "internal" }]);
@@ -610,14 +634,17 @@ test("Project routes use ordinary group sessions with the durable roster as auth
   assert.ok(reopened.every((window) => window.validTo === null && window.validFrom === 0));
   assert.equal((await turn("member", removableApprovalThread, "continue after rejoining")).status, "ok");
 
+  const queuedVersion = await built.projects.version(groupRef);
   const queued = await built.app.turn({
     surface: "web",
     actor: { externalId: "member" },
     conversation: { kind: "group", channelRef: groupRef, threadRef: "web:member:queued-before-removal", audience: [] },
     text: "work that must not cross membership tenures",
+    idempotencyKey: "project-dedup-compatibility",
     async: true,
   });
   assert.equal(queued.status, "queued");
+  assert.equal((await built.runs.get(queued.runId!))?.dedupKey, `project-dedup-compatibility:project-${queuedVersion}`);
   assert.equal((await built.app.removeProjectMember(project.id, "owner", "member")).status, "ok");
   assert.equal((await built.app.addProjectMember(project.id, "owner", "member")).status, "ok");
   built.runtime.start();

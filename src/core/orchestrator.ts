@@ -18,6 +18,7 @@ import { renderGatewayContext } from "./gateway-context.ts";
 import { deriveTurnOutcome, approvalBlocksInput } from "./turn-outcome.ts";
 import { applyPromptVars, loadProtocolFile, type PromptVars } from "../resolution/prompt-vars.ts";
 import { cleanBrandingLabel, resolveBranding } from "../resolution/branding.ts";
+import type { ManagedChannelDirectory } from "../resolution/scope-membership.ts";
 import { resolveReachableChannel } from "../resolution/scope-reach.ts";
 import { reachEnqueue } from "../reach/reach.ts";
 import type { DirectoryStore, DirectoryChannel, DirectoryMember } from "../directory/directory-store.ts";
@@ -172,7 +173,7 @@ export {
 } from "./orchestrator/turn-helpers.ts";
 export type { Orchestrator, OrchestratorDeps, OrchestratorInput, SurfaceContextPuller } from "./orchestrator/types.ts";
 
-class ProjectRosterChanged extends Error {}
+class ManagedRosterChanged extends Error {}
 
 const ACTIVITY_ENTRY_TYPES = new Set<EntryType>(["tool_call", "tool_result", "approval_request", "approval_resolved"]);
 
@@ -418,12 +419,22 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         deps.managedGroups?.recognizes(conversation.channelRef)
           ? conversation.channelRef
           : undefined;
+      const managedChannelRef =
+        conversation.kind === "channel" &&
+        conversation.channelRef &&
+        deps.managedChannels?.recognizes(conversation.channelRef)
+          ? conversation.channelRef
+          : undefined;
+      const managedRosterRef = managedGroupRef ?? managedChannelRef;
+      let managedRoster: Pick<ManagedChannelDirectory, "members" | "version" | "withVersion"> | undefined;
+      if (managedGroupRef) managedRoster = deps.managedGroups;
+      else if (managedChannelRef) managedRoster = deps.managedChannels;
       const managedRosterIsCurrent = async (): Promise<boolean> => {
-        if (!managedGroupRef) return true;
+        if (!managedRosterRef || !managedRoster) return true;
         const expected = new Set(input.sessionParticipantIds ?? []);
         const [current, version] = await Promise.all([
-          deps.managedGroups!.members(managedGroupRef).catch(() => undefined),
-          deps.managedGroups!.version(managedGroupRef).catch(() => undefined),
+          managedRoster.members(managedRosterRef).catch(() => undefined),
+          managedRoster.version(managedRosterRef).catch(() => undefined),
         ]);
         return (
           !!current &&
@@ -434,13 +445,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         );
       };
       const withManagedRosterVersion = async <T>(fn: () => Promise<T>): Promise<T> => {
-        if (!managedGroupRef) return fn();
-        const result = await deps.managedGroups!.withVersion(managedGroupRef, input.scopeVersion, fn);
-        if (result === undefined) throw new ProjectRosterChanged();
+        if (!managedRosterRef || !managedRoster) return fn();
+        const result = await managedRoster.withVersion(managedRosterRef, input.scopeVersion, fn);
+        if (result === undefined) throw new ManagedRosterChanged();
         return result;
       };
       if (!(await managedRosterIsCurrent())) {
-        return { status: "refused", reason: "project membership changed; retry from the current project" };
+        return { status: "refused", reason: "shared context membership changed; retry" };
       }
       if (conversation.kind !== "dm" && !deps.identity.audienceIsAllInternal(conversation.audience)) {
         const externalAllowed =
@@ -613,6 +624,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               ...screenedOverheard.map((entry) => ({ source: "overheard", content: renderOverheard(entry) })),
               ...attachmentPromptData,
               ...(input.inboundNotes ?? []).map((note) => ({ source: "inbound-file-note", content: note })),
+              ...(input.externalPromptData ?? []),
             ]
           : [];
       const screenPayload =
@@ -736,11 +748,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             return true;
           });
         } catch (err) {
-          if (err instanceof ProjectRosterChanged) {
+          if (err instanceof ManagedRosterChanged) {
             return {
               status: "refused",
               sessionId: session.id,
-              reason: "project membership changed; retry from the current project",
+              reason: "shared context membership changed; retry",
             };
           }
           throw err;
@@ -840,9 +852,17 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           type: defaultCandidate.type,
           target: defaultCandidate.target,
           ...(defaultCandidate.audienceScopeId ? { audienceScopeId: defaultCandidate.audienceScopeId } : {}),
+          ...(input.deliveryQueueKey ? { queueKey: input.deliveryQueueKey } : {}),
+          ...(defaultCandidate.type === "tlon" && input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
         };
       } else if (input.surfaceTools && input.origin.kind === "automation" && input.origin.destination) {
-        defaultDestination = input.origin.destination;
+        defaultDestination = {
+          ...input.origin.destination,
+          ...(input.deliveryQueueKey ? { queueKey: input.deliveryQueueKey } : {}),
+          ...(input.origin.destination.type === "tlon" && input.scopeVersion
+            ? { scopeVersion: input.scopeVersion }
+            : {}),
+        };
       }
       const cronBlock =
         delivery.candidates.length > 1 && deps.signingSecret && deps.apiBaseUrl
@@ -2161,7 +2181,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             .filter((s) => s && s.trim())
             .join("\n\n"),
         );
-        const baseText = input.proactiveOpener && !input.text.trim() ? PROACTIVE_OPENER_PROMPT : input.text;
+        const externalContext = (input.externalPromptData ?? [])
+          .map(
+            (datum) =>
+              `External data from ${JSON.stringify(datum.source.slice(0, 200))}:\n${datum.content.slice(0, 16_000)}`,
+          )
+          .join("\n\n");
+        const authoredText = input.proactiveOpener && !input.text.trim() ? PROACTIVE_OPENER_PROMPT : input.text;
+        const baseText = [authoredText, externalContext].filter((value) => value.trim()).join("\n\n");
         const pausedTurnUserEntry = input.approval
           ? [...visibleHistory].reverse().find((e) => e.type === "user" && !isOverheardEntry(e))
           : undefined;
@@ -2975,11 +3002,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         await deps.errors?.flush();
         return finalResult;
       } catch (err) {
-        if (err instanceof ProjectRosterChanged) {
+        if (err instanceof ManagedRosterChanged) {
           return {
             status: "refused",
             sessionId: session.id,
-            reason: "project membership changed; retry from the current project",
+            reason: "shared context membership changed; retry",
           };
         }
         if (err instanceof NeedsApproval) {
@@ -3007,11 +3034,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               return true;
             });
           } catch (writeErr) {
-            if (writeErr instanceof ProjectRosterChanged) {
+            if (writeErr instanceof ManagedRosterChanged) {
               return {
                 status: "refused",
                 sessionId: session.id,
-                reason: "project membership changed; retry from the current project",
+                reason: "shared context membership changed; retry",
               };
             }
             throw writeErr;
