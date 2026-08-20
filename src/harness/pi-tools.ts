@@ -290,11 +290,12 @@ export interface PiToolsOptions {
   mcpTools?: () => McpToolDescriptor[];
   controlTools?: boolean;
   readOnly?: boolean;
+  externalTools?: boolean;
   surfaceTools?: boolean;
   surfaceName?: string;
 }
 
-export type CoreToolOptions = Omit<PiToolsOptions, "readOnly" | "surfaceTools" | "surfaceName">;
+export type CoreToolOptions = Omit<PiToolsOptions, "readOnly" | "externalTools" | "surfaceTools" | "surfaceName">;
 
 export function coreToolOptions(config: Config): CoreToolOptions {
   return {
@@ -2755,7 +2756,7 @@ export function createPiTools(ref: ToolContextRef, opts?: PiToolsOptions): ToolD
     },
   });
 
-  const mcpDefs = opts?.mcpTools?.() ?? [];
+  const mcpDefs = opts?.externalTools ? (opts.mcpTools?.() ?? []) : [];
   const mcpTools = mcpDefs
     .filter((d) => !opts?.readOnly || d.readOnly)
     .map((d) =>

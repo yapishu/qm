@@ -2308,6 +2308,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
             ...(typeof effectiveFastMode === "boolean" ? { fastMode: effectiveFastMode } : {}),
             ...(strictReadOnly ? { readOnly: true } : {}),
+            ...(liveTurn ? { externalTools: true } : {}),
             ...(input.surfaceTools && surfaceToolDeps
               ? {
                   surfaceTools: true,

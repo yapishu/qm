@@ -102,6 +102,12 @@ test("org turn wall-clock governance reaches the harness and a per-turn cap only
   assert.equal((await app.turn(dm("!wallclock"))).reply, "wallclock:0");
 });
 
+test("tenant external tools are limited to live human turns", async () => {
+  const { app } = freshApp();
+  assert.equal((await app.turn(dm("!externaltools", { liveActor: true }))).reply, "externaltools:true");
+  assert.equal((await app.turn(dm("!externaltools", { triggered: true }))).reply, "externaltools:false");
+});
+
 test("inbound file problems ride a durable file_event entry — off the reply and the model context", async () => {
   const { app, sessions } = freshApp();
   const note = 'skipped "screenshot.png" — too many files in one message (max 10)';

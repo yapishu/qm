@@ -1,27 +1,32 @@
-// Admin CRUD for registered MCP servers.
-//
-// Registration is deliberately admin-only: a registered server is an outbound
-// HTTP destination every scope's agents can call, so it is governed like a
-// model-provider credential, not like a personal connector.
-
-import { isValidMcpServerId, type McpServer, type McpServerAuthMode } from "../../../mcp/mcp-server-store.ts";
+import { validateMcpServerUrl } from "../../../mcp/mcp-client.ts";
+import {
+  isValidMcpServerId,
+  MAX_MCP_SERVERS,
+  MIN_MCP_SECRET_CHARS,
+  type McpServer,
+  type McpServerAuthMode,
+} from "../../../mcp/mcp-server-store.ts";
 import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
 import { audit, authorizeAdmin, orgScope } from "../shared.ts";
 
-const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials"];
+const AUTH_MODES: McpServerAuthMode[] = ["none", "api-key", "bearer"];
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
 
 async function actor(ctx: ApiCtx) {
   const scope = orgScope(ctx.deps);
   return authorizeAdmin(ctx, scope);
 }
 
-function redact(server: McpServer): Omit<McpServer, "bearerToken" | "clientSecret"> & {
+function redact(server: McpServer): Omit<McpServer, "apiKey" | "bearerToken"> & {
+  hasApiKey: boolean;
   hasBearerToken: boolean;
-  hasClientSecret: boolean;
 } {
-  const { bearerToken, clientSecret, ...rest } = server;
-  return { ...rest, hasBearerToken: !!bearerToken, hasClientSecret: !!clientSecret };
+  const { apiKey, bearerToken, ...rest } = server;
+  return { ...rest, hasApiKey: !!apiKey, hasBearerToken: !!bearerToken };
 }
 
 export async function getMcpServers(ctx: ApiCtx): Promise<void> {
@@ -57,7 +62,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "id must be 2-40 chars: lowercase letters, digits, hyphens, starting with a letter",
     });
   }
-  const b = ctx.body as Partial<McpServer> & { validate?: boolean };
+  const b = ctx.body as Partial<McpServer> & { validate?: boolean; expectedUpdatedAt?: number | null };
   const url = typeof b.url === "string" ? b.url.trim() : "";
   let parsed: URL;
   try {
@@ -65,8 +70,8 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
   } catch {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "url must be a valid URL" });
   }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    return sendJson(ctx.res, 400, { error: "bad_request", message: "url must be http(s)" });
+  if (parsed.protocol !== "https:") {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "url must use https" });
   }
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     return sendJson(ctx.res, 400, {
@@ -79,46 +84,80 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     return sendJson(ctx.res, 400, { error: "bad_request", message: `auth must be one of ${AUTH_MODES.join(", ")}` });
   }
   const existing = await ctx.deps.mcpServers.get(id);
+  const enabled = b.enabled !== false;
+  const sameCredentialEndpoint = existing?.auth === auth && existing.url === url;
+  const apiKey = nonEmptyString(b.apiKey) ?? (sameCredentialEndpoint ? existing?.apiKey : undefined);
+  const bearerToken = nonEmptyString(b.bearerToken) ?? (sameCredentialEndpoint ? existing?.bearerToken : undefined);
   const server: McpServer = {
     id,
     name: typeof b.name === "string" && b.name.trim() ? b.name.trim().slice(0, 80) : id,
     url,
     auth,
-    ...(auth === "bearer"
-      ? { bearerToken: typeof b.bearerToken === "string" && b.bearerToken ? b.bearerToken : existing?.bearerToken }
-      : {}),
-    ...(auth === "client-credentials"
-      ? {
-          clientId: typeof b.clientId === "string" && b.clientId ? b.clientId : existing?.clientId,
-          clientSecret: typeof b.clientSecret === "string" && b.clientSecret ? b.clientSecret : existing?.clientSecret,
-        }
-      : {}),
-    readOnly: b.readOnly !== false,
-    enabled: b.enabled !== false,
-    updatedAt: Date.now(),
+    ...(auth === "api-key" ? { apiKey } : {}),
+    ...(auth === "bearer" ? { bearerToken } : {}),
+    readOnly: false,
+    enabled,
+    updatedAt: Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1),
     updatedBy: authorized.id,
   };
-  if (auth === "bearer" && !server.bearerToken) {
-    return sendJson(ctx.res, 400, { error: "bad_request", message: "bearer auth requires bearerToken" });
-  }
-  if (auth === "client-credentials" && (!server.clientId || !server.clientSecret)) {
+  if (auth === "api-key" && (server.apiKey?.length ?? 0) < MIN_MCP_SECRET_CHARS) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
-      message: "client-credentials auth requires clientId and clientSecret",
+      message: `api-key auth requires an API key of at least ${MIN_MCP_SECRET_CHARS} characters`,
     });
   }
-  let toolNames: string[] | undefined;
-  if (b.validate !== false && ctx.deps.mcpToolService) {
+  if (auth === "bearer" && (server.bearerToken?.length ?? 0) < MIN_MCP_SECRET_CHARS) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: `bearer auth requires a token of at least ${MIN_MCP_SECRET_CHARS} characters`,
+    });
+  }
+  if (enabled) {
     try {
-      toolNames = await ctx.deps.mcpToolService.probe(server);
+      await validateMcpServerUrl(url);
     } catch (e) {
       return sendJson(ctx.res, 400, {
-        error: "unreachable",
-        message: `tools/list against ${parsed.host} failed: ${e instanceof Error ? e.message : String(e)}`,
+        error: "bad_request",
+        message: e instanceof Error ? e.message : "MCP server URL is not allowed",
       });
     }
   }
-  await ctx.deps.mcpServers.put(server);
+  let toolNames: string[] | undefined;
+  if (enabled && b.validate !== false && ctx.deps.mcpToolService) {
+    try {
+      toolNames = await ctx.deps.mcpToolService.probe(server);
+    } catch {
+      return sendJson(ctx.res, 400, {
+        error: "unreachable",
+        message: `tools/list against ${parsed.host} failed`,
+      });
+    }
+  }
+  const storedServer: McpServer = { ...server };
+  if (auth === "api-key" && !(typeof b.apiKey === "string" && b.apiKey)) delete storedServer.apiKey;
+  if (auth === "bearer" && !(typeof b.bearerToken === "string" && b.bearerToken)) delete storedServer.bearerToken;
+  const expectedUpdatedAt =
+    b.expectedUpdatedAt === null || Number.isSafeInteger(b.expectedUpdatedAt) ? b.expectedUpdatedAt : null;
+  const putResult = await ctx.deps.mcpServers.put(storedServer, expectedUpdatedAt);
+  if (putResult === "limit") {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: `at most ${MAX_MCP_SERVERS} MCP servers are allowed`,
+    });
+  }
+  if (putResult === "invalid" || putResult === "conflict") {
+    return sendJson(ctx.res, 409, {
+      error: "conflict",
+      message: "MCP server changed; reload it and try again",
+    });
+  }
+  await ctx.deps.mcpToolService?.refresh();
+  if (enabled && ctx.deps.mcpToolService) {
+    toolNames = ctx.deps.mcpToolService
+      .toolDefs()
+      .filter((tool) => tool.serverId === id)
+      .map((tool) => tool.remoteName);
+  }
   audit(ctx.deps, {
     principalId: authorized.id,
     action: "mcp-servers.update",
@@ -133,8 +172,18 @@ export async function deleteMcpServer(ctx: ApiCtx): Promise<void> {
   if (!authorized) return;
   if (!ctx.deps.mcpServers) return sendJson(ctx.res, 404, { error: "not_found" });
   const id = ctx.params.id ?? "";
-  if (!(await ctx.deps.mcpServers.get(id))) return sendJson(ctx.res, 404, { error: "not_found" });
-  await ctx.deps.mcpServers.delete(id);
+  const rawExpectedUpdatedAt = ctx.url.searchParams.get("expectedUpdatedAt");
+  const expectedUpdatedAt =
+    rawExpectedUpdatedAt === null || rawExpectedUpdatedAt === "" ? NaN : Number(rawExpectedUpdatedAt);
+  if (!Number.isSafeInteger(expectedUpdatedAt)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "expectedUpdatedAt is required" });
+  }
+  const result = await ctx.deps.mcpServers.delete(id, expectedUpdatedAt);
+  if (result === "not_found") return sendJson(ctx.res, 404, { error: "not_found" });
+  if (result === "conflict") {
+    return sendJson(ctx.res, 409, { error: "conflict", message: "MCP server changed; reload it and try again" });
+  }
+  await ctx.deps.mcpToolService?.refresh();
   audit(ctx.deps, {
     principalId: authorized.id,
     action: "mcp-servers.delete",

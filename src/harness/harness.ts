@@ -63,6 +63,7 @@ export interface HarnessTurnInput {
   thinkingLevel?: string;
   fastMode?: boolean;
   readOnly?: boolean;
+  externalTools?: boolean;
   surfaceTools?: boolean;
   surfaceName?: string;
   pollFire?: boolean;

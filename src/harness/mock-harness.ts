@@ -251,6 +251,8 @@ export function createMockHarness(): Harness {
           reply = turn.systemPrompt;
         } else if (command0 === "!wallclock") {
           reply = `wallclock:${turn.turnWallClockMs ?? 0}`;
+        } else if (command0 === "!externaltools") {
+          reply = `externaltools:${turn.externalTools === true}`;
         } else if (command0.startsWith("!askagent ")) {
           const rest = command0.slice("!askagent ".length).trim();
           const sp = rest.indexOf(" ");

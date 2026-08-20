@@ -1363,6 +1363,9 @@
         font-size: 12px;
         font-variant-numeric: tabular-nums;
       }
+      .mcp-auth-field {
+        display: block;
+      }
       .hidden {
         display: none;
       }
@@ -4840,6 +4843,79 @@
                 ><span class="status" id="st-connectors"></span>
               </div>
             </section>
+            <section class="card" id="card-mcp-servers">
+              <div class="head">
+                <h2>External MCP servers</h2>
+                <p>
+                  Connect tenant-wide tools that the assistant can use directly from Tlon conversations and shared
+                  channel workspaces. Only tenant admins can manage them. Credentials are encrypted at rest, write-only,
+                  and never sent to agent sandboxes.
+                </p>
+              </div>
+              <div class="body"><div id="mcp-list" class="hint">No MCP servers configured.</div></div>
+              <div class="body" style="border-top: 1px solid var(--border, #2a2a2a); padding-top: 12px">
+                <div class="sc-form-head">
+                  <p class="hint" id="mcp-form-title">Add an MCP server</p>
+                  <span class="badge muted" id="mcp-form-mode">New</span>
+                </div>
+                <label style="display: block; margin-bottom: 8px"
+                  >Server ID
+                  <input type="text" id="mcp-id" autocomplete="off" placeholder="team-tools" style="width: 100%"
+                /></label>
+                <label style="display: block; margin-bottom: 8px"
+                  >Name
+                  <input type="text" id="mcp-name" autocomplete="off" placeholder="Team tools" style="width: 100%"
+                /></label>
+                <label style="display: block; margin-bottom: 8px"
+                  >MCP URL
+                  <input
+                    type="url"
+                    id="mcp-url"
+                    autocomplete="off"
+                    placeholder="https://tools.example.com/mcp"
+                    style="width: 100%"
+                /></label>
+                <label style="display: block; margin-bottom: 8px"
+                  >Authentication
+                  <select id="mcp-auth" style="width: 100%">
+                    <option value="api-key">X-Api-Key header</option>
+                    <option value="bearer">Bearer token</option>
+                    <option value="none">None</option>
+                  </select></label
+                >
+                <label id="mcp-api-key-field" class="mcp-auth-field" style="margin-bottom: 8px"
+                  >API key
+                  <input
+                    type="password"
+                    id="mcp-api-key"
+                    autocomplete="off"
+                    placeholder="(write-only)"
+                    style="width: 100%"
+                /></label>
+                <label id="mcp-bearer-field" class="mcp-auth-field hidden" style="margin-bottom: 8px"
+                  >Bearer token
+                  <input
+                    type="password"
+                    id="mcp-bearer-token"
+                    autocomplete="off"
+                    placeholder="(write-only)"
+                    style="width: 100%"
+                /></label>
+                <p class="field-hint" id="mcp-secret-hint">
+                  The key is sent as <code>x-api-key</code>. Saving validates the server with <code>tools/list</code>.
+                </p>
+                <p class="field-hint">
+                  Servers must use public HTTPS endpoints. Up to 16 can be configured per tenant.
+                </p>
+                <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin-bottom: 10px"
+                  ><input type="checkbox" id="mcp-enabled" style="width: auto" checked /> Enabled</label
+                >
+              </div>
+              <div class="foot">
+                <button class="primary" id="mcp-save">Validate and save</button
+                ><button id="mcp-reset">Clear form</button><span class="status" id="st-mcp-servers"></span>
+              </div>
+            </section>
             <section class="card" id="card-slack-installation">
               <div class="head">
                 <h2>Slack bot</h2>
@@ -7473,7 +7549,7 @@
           $("conn-provider").value = connEditing;
           $("conn-provider").disabled = true;
         } else resetConnForm();
-        await loadSlackInstallation();
+        await Promise.all([loadSlackInstallation(), loadMcpServers()]);
       }
       function renderConnList(list) {
         connList = list;
@@ -7631,6 +7707,210 @@
         if (connList.length) renderConnList(connList);
       }
       $("conn-provider").onchange = renderConnGuide;
+      let mcpEditing = null;
+      let mcpEditVersion = null;
+      let mcpServers = [];
+      let mcpTools = [];
+      const mcpAuthLabel = (auth) => (auth === "api-key" ? "X-Api-Key" : auth === "bearer" ? "Bearer" : "No auth");
+      const mcpHasSecret = (server) =>
+        server.auth === "api-key" ? server.hasApiKey : server.auth === "bearer" ? server.hasBearerToken : true;
+      function renderMcpAuth() {
+        const auth = $("mcp-auth").value;
+        $("mcp-api-key-field").classList.toggle("hidden", auth !== "api-key");
+        $("mcp-bearer-field").classList.toggle("hidden", auth !== "bearer");
+        $("mcp-secret-hint").innerHTML =
+          auth === "api-key"
+            ? "The key is sent as <code>x-api-key</code>. Saving validates the server with <code>tools/list</code>."
+            : auth === "bearer"
+              ? "The token is sent as <code>Authorization: Bearer</code>. Saving validates <code>tools/list</code>."
+              : "Saving validates the unauthenticated server with <code>tools/list</code>.";
+      }
+      function renderMcpServers() {
+        const root = $("mcp-list");
+        root.textContent = "";
+        if (!mcpServers.length) {
+          root.className = "hint";
+          root.textContent = "No MCP servers configured.";
+          return;
+        }
+        root.className = "";
+        mcpServers.forEach((server) => {
+          const row = document.createElement("div");
+          row.className = "credential-row";
+          if (server.id === mcpEditing) row.classList.add("is-editing");
+          const left = document.createElement("div");
+          left.className = "credential-main";
+          const title = document.createElement("div");
+          title.className = "credential-title";
+          const name = document.createElement("strong");
+          name.textContent = server.name;
+          title.append(name, badge(server.id, "muted"));
+          const meta = document.createElement("div");
+          meta.className = "hint";
+          meta.textContent = server.url + (server.updatedBy ? " · by " + server.updatedBy : "");
+          const tools = mcpTools.filter((tool) => tool.serverId === server.id);
+          const badges = document.createElement("div");
+          badges.className = "credential-badges";
+          badges.append(
+            badge(server.enabled ? "Enabled" : "Disabled", server.enabled ? "ok" : "warn"),
+            badge(mcpAuthLabel(server.auth), mcpHasSecret(server) ? "ok" : "err"),
+            badge("Interactive turns only", "muted"),
+            badge(tools.length + (tools.length === 1 ? " tool" : " tools"), tools.length ? "info" : "muted"),
+          );
+          if (tools.length) {
+            const names = document.createElement("div");
+            names.className = "hint";
+            names.textContent = tools.map((tool) => tool.name).join(", ");
+            left.append(title, meta, badges, names);
+          } else left.append(title, meta, badges);
+          const actions = document.createElement("div");
+          actions.className = "credential-actions";
+          const edit = document.createElement("button");
+          edit.type = "button";
+          edit.textContent = "Edit";
+          edit.onclick = () => loadMcpForm(server);
+          const del = document.createElement("button");
+          del.type = "button";
+          del.className = "rowbtn danger";
+          del.textContent = "Delete";
+          del.onclick = () => deleteMcpServer(server);
+          actions.append(edit, del);
+          row.append(left, actions);
+          root.appendChild(row);
+        });
+      }
+      async function loadMcpServers() {
+        const result = await api("GET", "/api/mcp-servers");
+        if (!result.ok) {
+          setStatus(
+            "st-mcp-servers",
+            result.status === 403
+              ? "Only an org admin can manage MCP servers."
+              : result.data?.message || "Failed to load.",
+            "err",
+          );
+          return;
+        }
+        mcpServers = result.data.servers || [];
+        mcpTools = result.data.tools || [];
+        if (mcpEditing && !mcpServers.some((server) => server.id === mcpEditing)) mcpEditing = null;
+        renderMcpServers();
+        if (!mcpEditing) resetMcpForm();
+      }
+      function loadMcpForm(server) {
+        mcpEditing = server.id;
+        mcpEditVersion = server.updatedAt;
+        $("mcp-form-title").textContent = "Editing " + server.name;
+        $("mcp-form-mode").textContent = "Editing";
+        $("mcp-form-mode").className = "badge info";
+        $("mcp-save").textContent = "Validate and save changes";
+        $("mcp-reset").textContent = "Cancel edit";
+        $("mcp-id").value = server.id;
+        $("mcp-id").disabled = true;
+        $("mcp-name").value = server.name || "";
+        $("mcp-url").value = server.url || "";
+        $("mcp-auth").value = server.auth;
+        $("mcp-api-key").value = "";
+        $("mcp-bearer-token").value = "";
+        $("mcp-api-key").placeholder = server.hasApiKey ? "•••• set (leave blank to keep)" : "(write-only)";
+        $("mcp-bearer-token").placeholder = server.hasBearerToken ? "•••• set (leave blank to keep)" : "(write-only)";
+        $("mcp-enabled").checked = server.enabled;
+        renderMcpAuth();
+        renderMcpServers();
+        $("card-mcp-servers").scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      function resetMcpForm() {
+        mcpEditing = null;
+        mcpEditVersion = null;
+        $("mcp-form-title").textContent = "Add an MCP server";
+        $("mcp-form-mode").textContent = "New";
+        $("mcp-form-mode").className = "badge muted";
+        $("mcp-save").textContent = "Validate and save";
+        $("mcp-reset").textContent = "Clear form";
+        $("mcp-id").value = "";
+        $("mcp-id").disabled = false;
+        $("mcp-name").value = "";
+        $("mcp-url").value = "";
+        $("mcp-auth").value = "api-key";
+        $("mcp-api-key").value = "";
+        $("mcp-api-key").placeholder = "(write-only)";
+        $("mcp-bearer-token").value = "";
+        $("mcp-bearer-token").placeholder = "(write-only)";
+        $("mcp-enabled").checked = true;
+        renderMcpAuth();
+        if (mcpServers.length) renderMcpServers();
+      }
+      async function deleteMcpServer(server) {
+        if (
+          !confirm(
+            "Delete MCP server " + server.id + "? Its tools will immediately disappear from every tenant workspace.",
+          )
+        )
+          return;
+        const result = await api(
+          "DELETE",
+          "/api/mcp-servers/" +
+            encodeURIComponent(server.id) +
+            "?expectedUpdatedAt=" +
+            encodeURIComponent(server.updatedAt),
+        );
+        if (!result.ok) {
+          setStatus("st-mcp-servers", result.data?.message || "Delete failed.", "err");
+          return;
+        }
+        resetMcpForm();
+        await loadMcpServers();
+        setStatus("st-mcp-servers", "Deleted", "ok");
+      }
+      $("mcp-auth").onchange = renderMcpAuth;
+      $("mcp-reset").onclick = resetMcpForm;
+      $("mcp-save").onclick = async () => {
+        const id = $("mcp-id").value.trim();
+        const name = $("mcp-name").value.trim();
+        const url = $("mcp-url").value.trim();
+        const auth = $("mcp-auth").value;
+        if (!/^[a-z][a-z0-9-]{1,39}$/.test(id)) {
+          setStatus("st-mcp-servers", "Server ID must be 2–40 lowercase letters, digits, or hyphens.", "err");
+          return;
+        }
+        if (!url) {
+          setStatus("st-mcp-servers", "MCP URL is required.", "err");
+          return;
+        }
+        const existing = mcpServers.find((server) => server.id === id);
+        const body = {
+          name: name || id,
+          url,
+          auth,
+          enabled: $("mcp-enabled").checked,
+          expectedUpdatedAt: mcpEditing ? mcpEditVersion : null,
+        };
+        if (auth === "api-key") {
+          body.apiKey = $("mcp-api-key").value;
+          if (!body.apiKey && !existing?.hasApiKey) {
+            setStatus("st-mcp-servers", "API key is required.", "err");
+            return;
+          }
+        } else if (auth === "bearer") {
+          body.bearerToken = $("mcp-bearer-token").value;
+          if (!body.bearerToken && !existing?.hasBearerToken) {
+            setStatus("st-mcp-servers", "Bearer token is required.", "err");
+            return;
+          }
+        }
+        $("mcp-save").disabled = true;
+        setStatus("st-mcp-servers", "Validating tools/list…", "saving", true);
+        const result = await api("PUT", "/api/mcp-servers/" + encodeURIComponent(id), body);
+        $("mcp-save").disabled = false;
+        if (!result.ok) {
+          setStatus("st-mcp-servers", result.data?.message || "Validation failed.", "err", true);
+          return;
+        }
+        resetMcpForm();
+        await loadMcpServers();
+        const count = result.data.tools?.length || 0;
+        setStatus("st-mcp-servers", "Saved · " + count + (count === 1 ? " tool" : " tools") + " available", "ok");
+      };
       async function loadSlackInstallation() {
         const r = await api("GET", "/api/slack-installation");
         if (!r.ok) {

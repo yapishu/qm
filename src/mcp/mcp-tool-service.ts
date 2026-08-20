@@ -1,47 +1,70 @@
-// Turns registered MCP servers into callable agent tools.
-//
-// Maintains a cached snapshot of each enabled server's tool list (refreshed
-// when the registry changes and on a slow interval), and executes calls with
-// the server's configured credential. Every call is audited. Tool names are
-// namespaced `<serverId>_<toolName>` so two servers can't collide with each
-// other or with built-in tools.
-
+import { createHash } from "node:crypto";
 import type { AuditLog } from "../audit/audit-log.ts";
 import { errMessage } from "../util/errors.ts";
 import { createMcpClient, mcpResultText, type McpAuth, type McpClient, type McpFetch } from "./mcp-client.ts";
-import type { McpServer, McpServerStore } from "./mcp-server-store.ts";
+import { MAX_MCP_SERVERS, type McpServer, type McpServerStore } from "./mcp-server-store.ts";
 
-const REFRESH_INTERVAL_MS = 5 * 60_000;
-const MAX_TOOLS_PER_SERVER = 64;
+const REFRESH_INTERVAL_MS = 5_000;
+const REMOTE_REFRESH_INTERVAL_MS = 5 * 60_000;
+const MAX_TOOLS_PER_SERVER = 32;
+const MAX_TENANT_TOOLS = 128;
+const MAX_TENANT_CATALOG_BYTES = 512 * 1024;
 const MAX_RESULT_CHARS = 60_000;
 
 export interface McpToolDescriptor {
-  /** Namespaced tool name exposed to the model, e.g. "salesforce_query". */
   name: string;
   serverId: string;
   remoteName: string;
   description: string;
   inputSchema: Record<string, unknown>;
   readOnly: boolean;
+  configVersion: string;
 }
 
 export interface McpToolService {
-  /** Current snapshot of injectable tools across enabled servers. */
   toolDefs(): McpToolDescriptor[];
-  /** Call a namespaced tool. Returns the tool's text output (clamped). */
   call(name: string, args: Record<string, unknown>, principalId?: string): Promise<string>;
-  /** Force a registry re-read + tools/list refresh (admin save path, tests). */
   refresh(): Promise<void>;
-  /** Probe a server config without persisting it. Returns its tool names. */
   probe(server: McpServer): Promise<string[]>;
-  close(): void;
+  close(): Promise<void> | void;
+}
+
+function versionOf(server: McpServer): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        server.id,
+        server.name,
+        server.url,
+        server.auth,
+        server.apiKey ?? "",
+        server.bearerToken ?? "",
+        server.readOnly,
+        server.enabled,
+        server.updatedAt,
+        server.updatedBy,
+      ]),
+    )
+    .digest("hex");
 }
 
 function authOf(server: McpServer): McpAuth {
+  if (server.auth === "api-key") return { mode: "api-key", apiKey: server.apiKey ?? "" };
   if (server.auth === "bearer") return { mode: "bearer", token: server.bearerToken ?? "" };
-  if (server.auth === "client-credentials")
-    return { mode: "client-credentials", clientId: server.clientId ?? "", clientSecret: server.clientSecret ?? "" };
-  return { mode: "none" };
+  if (server.auth === "none") return { mode: "none" };
+  throw new Error(`unsupported MCP authentication mode: ${String(server.auth)}`);
+}
+
+function toolName(serverId: string, remoteName: string): string {
+  const encoded = Array.from(Buffer.from(remoteName), (byte) => {
+    const char = String.fromCharCode(byte);
+    return /[a-zA-Z0-9]/.test(char) ? char : `_${byte.toString(16).padStart(2, "0")}`;
+  }).join("");
+  const prefix = `mcp_${serverId}_`;
+  const plain = `${prefix}${encoded}`;
+  if (plain.length <= 64) return plain;
+  const suffix = createHash("sha256").update(remoteName).digest("hex").slice(0, 12);
+  return `${prefix}${encoded.slice(0, 64 - prefix.length - suffix.length - 1)}_${suffix}`;
 }
 
 export function createMcpToolService(opts: {
@@ -53,7 +76,12 @@ export function createMcpToolService(opts: {
 }): McpToolService {
   const now = opts.now ?? (() => Date.now());
   const clients = new Map<string, { client: McpClient; server: McpServer }>();
+  const cachedDefs = new Map<string, { version: string; checkedAt: number; defs: McpToolDescriptor[] }>();
+  const validatedDefs = new Map<string, { version: string; checkedAt: number; defs: McpToolDescriptor[] }>();
+  const abort = new AbortController();
   let snapshot: McpToolDescriptor[] = [];
+  let refreshActive: Promise<void> | null = null;
+  let refreshRequested = false;
   let closed = false;
 
   function record(action: string, resource: string, status: string, principalId?: string): void {
@@ -70,45 +98,111 @@ export function createMcpToolService(opts: {
   function clientFor(server: McpServer): McpClient {
     const cached = clients.get(server.id);
     if (cached && JSON.stringify(cached.server) === JSON.stringify(server)) return cached.client;
+    if (cached) void cached.client.close().catch(() => {});
     const client = createMcpClient({
       url: server.url,
       auth: authOf(server),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-      now,
+      signal: abort.signal,
     });
     clients.set(server.id, { client, server });
     return client;
   }
 
-  async function refresh(): Promise<void> {
-    const servers = (await opts.servers.list()).filter((s) => s.enabled);
-    const next: McpToolDescriptor[] = [];
-    for (const server of servers) {
-      try {
-        const tools = (await clientFor(server).listTools()).slice(0, MAX_TOOLS_PER_SERVER);
-        for (const tool of tools) {
-          next.push({
-            name: `${server.id}_${tool.name}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
-            serverId: server.id,
-            remoteName: tool.name,
-            description: tool.description || `${tool.name} on ${server.name}`,
-            inputSchema: tool.inputSchema,
-            readOnly: server.readOnly,
-          });
-        }
-        record("list", server.id, `ok tools=${tools.length}`);
-      } catch (e) {
-        record("list", server.id, `error: ${errMessage(e)}`);
-      }
-    }
-    // De-duplicate on the namespaced name; first server wins deterministically.
-    const seen = new Set<string>();
-    snapshot = next.filter((t) => (seen.has(t.name) ? false : (seen.add(t.name), true)));
+  function descriptors(server: McpServer, tools: Awaited<ReturnType<McpClient["listTools"]>>): McpToolDescriptor[] {
+    const configVersion = versionOf(server);
+    return tools.slice(0, MAX_TOOLS_PER_SERVER).map((tool) => ({
+      name: toolName(server.id, tool.name),
+      serverId: server.id,
+      remoteName: tool.name,
+      description: tool.description || `${tool.name} on ${server.name}`,
+      inputSchema: tool.inputSchema,
+      readOnly: false,
+      configVersion,
+    }));
   }
 
-  const unsubscribe = opts.servers.onChange(() => {
-    void refresh();
-  });
+  async function refreshOnce(): Promise<void> {
+    let servers: McpServer[];
+    try {
+      servers = (await opts.servers.list()).filter((server) => server.enabled).slice(0, MAX_MCP_SERVERS);
+    } catch (e) {
+      record("refresh", "registry", `error: ${errMessage(e)}`);
+      return;
+    }
+    const resolved = await Promise.all(
+      servers.map(async (server) => {
+        const version = versionOf(server);
+        const validated = validatedDefs.get(server.id);
+        if (validated?.version === version && now() - validated.checkedAt < REMOTE_REFRESH_INTERVAL_MS)
+          return validated;
+        const cached = cachedDefs.get(server.id);
+        if (cached?.version === version && now() - cached.checkedAt < REMOTE_REFRESH_INTERVAL_MS) return cached;
+        try {
+          const tools = await clientFor(server).listTools();
+          const defs = descriptors(server, tools);
+          record("list", server.id, `ok tools=${tools.length}`);
+          return { version, checkedAt: now(), defs };
+        } catch (e) {
+          record("list", server.id, `error: ${errMessage(e)}`);
+          return null;
+        }
+      }),
+    );
+    if (closed) return;
+    cachedDefs.clear();
+    for (let index = 0; index < servers.length; index += 1) {
+      const cached = resolved[index];
+      if (cached) {
+        const id = servers[index]!.id;
+        cachedDefs.set(id, cached);
+        if (validatedDefs.get(id)?.version === cached.version) validatedDefs.delete(id);
+      }
+    }
+    const seen = new Set<string>();
+    const next: McpToolDescriptor[] = [];
+    let catalogBytes = 2;
+    for (const cached of resolved) {
+      for (const def of cached?.defs ?? []) {
+        if (seen.has(def.name)) continue;
+        const bytes = Buffer.byteLength(JSON.stringify(def)) + (next.length ? 1 : 0);
+        if (catalogBytes + bytes > MAX_TENANT_CATALOG_BYTES) continue;
+        seen.add(def.name);
+        catalogBytes += bytes;
+        next.push(def);
+        if (next.length >= MAX_TENANT_TOOLS) break;
+      }
+      if (next.length >= MAX_TENANT_TOOLS) break;
+    }
+    snapshot = next;
+    const activeIds = new Set(servers.map((server) => server.id));
+    for (const [id, client] of clients) {
+      if (!activeIds.has(id)) {
+        clients.delete(id);
+        void client.client.close().catch(() => {});
+      }
+    }
+    for (const [id, validated] of validatedDefs) {
+      if (now() - validated.checkedAt >= REMOTE_REFRESH_INTERVAL_MS) validatedDefs.delete(id);
+    }
+  }
+
+  function refresh(): Promise<void> {
+    if (closed) return Promise.resolve();
+    refreshRequested = true;
+    if (!refreshActive) {
+      refreshActive = (async () => {
+        while (refreshRequested && !closed) {
+          refreshRequested = false;
+          await refreshOnce();
+        }
+      })().finally(() => {
+        refreshActive = null;
+      });
+    }
+    return refreshActive;
+  }
+
   const timer = setInterval(() => {
     if (!closed) void refresh();
   }, opts.refreshIntervalMs ?? REFRESH_INTERVAL_MS);
@@ -122,6 +216,7 @@ export function createMcpToolService(opts: {
       if (!def) throw new Error(`unknown MCP tool: ${name}`);
       const server = await opts.servers.get(def.serverId);
       if (!server || !server.enabled) throw new Error(`MCP server ${def.serverId} is not available`);
+      if (versionOf(server) !== def.configVersion) throw new Error(`MCP server ${def.serverId} configuration changed`);
       try {
         const result = await clientFor(server).callTool(def.remoteName, args);
         record("call", `${def.serverId}/${def.remoteName}`, "ok", principalId);
@@ -138,15 +233,28 @@ export function createMcpToolService(opts: {
         url: server.url,
         auth: authOf(server),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-        now,
+        signal: abort.signal,
       });
-      const tools = await client.listTools();
-      return tools.map((t) => t.name);
+      try {
+        const tools = await client.listTools();
+        validatedDefs.set(server.id, {
+          version: versionOf(server),
+          checkedAt: now(),
+          defs: descriptors(server, tools),
+        });
+        return tools.map((t) => t.name);
+      } finally {
+        await client.close().catch(() => {});
+      }
     },
-    close() {
+    async close() {
       closed = true;
+      refreshRequested = false;
       clearInterval(timer);
-      unsubscribe();
+      const closing = Array.from(clients.values(), (client) => client.client.close());
+      clients.clear();
+      abort.abort();
+      await Promise.allSettled(closing);
     },
   };
 }

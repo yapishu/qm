@@ -120,6 +120,7 @@ function toolOptions(opts: OpenCodeHarnessOptions, turn?: HarnessTurnInput): PiT
     ...(turn
       ? {
           readOnly: turn.readOnly,
+          externalTools: turn.externalTools,
           surfaceTools: turn.surfaceTools,
           surfaceName: turn.surfaceName,
           credentialExecServices: turn.credentialExecServices,
@@ -453,8 +454,8 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
   const active = new Map<string, ActiveTurn>();
   const definitionRef: ToolContextRef = { current: null };
   const definitionTools = [
-    ...asTools(definitionRef, toolOptions(opts)),
-    ...asTools(definitionRef, { ...toolOptions(opts), surfaceTools: false }),
+    ...asTools(definitionRef, { ...toolOptions(opts), externalTools: true }),
+    ...asTools(definitionRef, { ...toolOptions(opts), externalTools: true, surfaceTools: false }),
   ];
   const definitions = [
     ...new Map(

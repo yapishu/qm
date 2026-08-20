@@ -23,6 +23,7 @@ for (const [network, prefix] of [
 for (const [network, prefix] of [
   ["::", 128],
   ["::1", 128],
+  ["64:ff9b::", 96],
   ["64:ff9b:1::", 48],
   ["fc00::", 7],
   ["fec0::", 10],
@@ -44,5 +45,6 @@ function normalizedIp(raw: string): string | null {
 export function isPrivateNetworkIp(raw: string): boolean {
   const value = normalizedIp(raw);
   if (!value) return false;
+  if (value.startsWith("::ffff:")) return true;
   return PRIVATE_NETWORKS.check(value, isIP(value) === 4 ? "ipv4" : "ipv6");
 }

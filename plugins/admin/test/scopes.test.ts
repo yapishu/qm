@@ -80,6 +80,28 @@ test("GET /api/connector-catalog forwards the live connector catalog signed + at
   assert.equal(c.signed, true);
 });
 
+test("MCP server setup forwards signed and attributed", async () => {
+  const get = await fetch(`${base}/api/mcp-servers`, { headers: { cookie: ADMIN } });
+  assert.equal(get.status, 200);
+  assert.equal(calls.at(-1)!.url, "/v1/admin/mcp-servers");
+  assert.equal(calls.at(-1)!.signed, true);
+
+  const put = await fetch(`${base}/api/mcp-servers/team-tools`, {
+    method: "PUT",
+    headers: { cookie: ADMIN, "content-type": "application/json" },
+    body: JSON.stringify({ auth: "api-key", apiKey: "secret" }),
+  });
+  assert.equal(put.status, 200);
+  assert.equal(calls.at(-1)!.url, "/v1/admin/mcp-servers/team-tools");
+  assert.equal(calls.at(-1)!.actor, "U-admin@acme");
+  assert.equal(calls.at(-1)!.signed, true);
+
+  const del = await fetch(`${base}/api/mcp-servers/team-tools`, { method: "DELETE", headers: { cookie: ADMIN } });
+  assert.equal(del.status, 200);
+  assert.equal(calls.at(-1)!.url, "/v1/admin/mcp-servers/team-tools");
+  assert.equal(calls.at(-1)!.signed, true);
+});
+
 test("the scope directory requires a signed-in cookie → 401 (no core hop)", async () => {
   const before = calls.length;
   assert.equal((await fetch(`${base}/api/scopes`)).status, 401);

@@ -34,6 +34,21 @@ test("connector setup uses the live catalog and shows exact provider and callbac
   assert.match(html, /encrypted in durable storage/);
 });
 
+test("connector setup manages external MCP servers with x-api-key authentication", () => {
+  assert.match(html, /id="card-mcp-servers"/);
+  assert.match(html, /tenant-wide tools/);
+  assert.match(html, /Only tenant admins can manage them/);
+  assert.match(html, /<option value="api-key">X-Api-Key header<\/option>/);
+  assert.match(html, /public HTTPS endpoints/);
+  assert.match(html, /api\("GET", "\/api\/mcp-servers"\)/);
+  assert.match(html, /api\("PUT", "\/api\/mcp-servers\/" \+ encodeURIComponent\(id\), body\)/);
+  assert.match(html, /"\?expectedUpdatedAt=" \+\s*encodeURIComponent\(server\.updatedAt\)/);
+  assert.match(html, /mcpEditVersion = server\.updatedAt/);
+  assert.match(html, /expectedUpdatedAt: mcpEditing \? mcpEditVersion : null/);
+  assert.doesNotMatch(html, /id="mcp-read-only"/);
+  assert.match(html, /Validating tools\/list/);
+});
+
 test("temporary onboarding covers model credentials, Slack, and OAuth setup", () => {
   assert.match(html, /view-onboarding/);
   assert.match(html, /Model provider/);

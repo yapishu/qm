@@ -237,6 +237,7 @@ function toolOptions(opts: CodexHarnessOptions, turn?: HarnessTurnInput): PiTool
     ...(turn
       ? {
           readOnly: turn.readOnly,
+          externalTools: turn.externalTools,
           surfaceTools: turn.surfaceTools,
           surfaceName: turn.surfaceName,
           credentialExecServices: turn.credentialExecServices,

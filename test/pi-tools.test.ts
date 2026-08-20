@@ -373,6 +373,54 @@ test("each pi tool emits a tool_call then a tool_result", async () => {
   );
 });
 
+test("a Tlon surface turn receives tenant MCP tools and treats their output as external data", async () => {
+  const emitted: Emitted[] = [];
+  const context = fakeToolContext();
+  context.mcpToolDefs = () => [
+    {
+      name: "mcp_team_search",
+      serverId: "team",
+      remoteName: "search",
+      description: "Search team systems",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      readOnly: true,
+      configVersion: "v1",
+    },
+  ];
+  context.callMcpTool = async (name, args) => `${name}:${String(args.query)}`;
+  const ref: ToolContextRef = {
+    current: context,
+    emit: (entry) => {
+      emitted.push(entry as Emitted);
+    },
+    scopeLabel: "channel:tlon:team-room",
+    async screenExternalContent({ content, tool, source }) {
+      assert.equal(content, "mcp_team_search:launch");
+      assert.deepEqual({ tool, source }, { tool: "mcp_team_search", source: "mcp server team" });
+      return { decision: "auto" };
+    },
+  };
+  const tools = createPiTools(ref, {
+    surfaceTools: true,
+    surfaceName: "tlon",
+    readOnly: true,
+    externalTools: true,
+    mcpTools: () => context.mcpToolDefs(),
+  });
+  assert.ok(
+    !createPiTools(ref, { mcpTools: () => context.mcpToolDefs() }).some((tool) => tool.name === "mcp_team_search"),
+  );
+  const result = await call(
+    tools.find((tool) => tool.name === "mcp_team_search"),
+    { query: "launch" },
+  );
+  assert.match(JSON.stringify(result), /mcp_team_search:launch/);
+  assert.deepEqual(
+    emitted.map((entry) => entry.type),
+    ["tool_call", "tool_result"],
+  );
+});
+
 test("execute's computer param manages the box out-of-band instead of running a command", async () => {
   const restarted: number[] = [];
   const tc = {
